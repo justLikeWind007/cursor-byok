@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cursor Proxy Debugger"
+  short_description: "维护、诊断并验证独立的 Cursor HTTPS 协议调试代理"
+  default_prompt: "Use $cursor-proxy-debugger to diagnose or modify the standalone Cursor protocol debugging proxy at /Users/leokun/Documents/cursor-proxy-debugger."
