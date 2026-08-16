@@ -1,0 +1,16 @@
+use cursor_server::{App, Config};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "cursor_server=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    App::new(Config::from_env()?).await?.serve().await?;
+    Ok(())
+}

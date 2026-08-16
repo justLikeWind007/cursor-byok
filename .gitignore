@@ -9,6 +9,7 @@ frontend/bindings
 dist
 node_modules
 cursor-server.tar
+/cursor-server/target/
 server-node/cursor.tar
 server-go/cursor.tar
 server-go/log/
