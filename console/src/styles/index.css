@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+@layer base {
+  body { @apply m-0 bg-zinc-950 font-sans text-zinc-100 antialiased; }
+  h1 { @apply text-2xl font-semibold tracking-tight; }
+  h2 { @apply text-base font-semibold; }
+  p { @apply mt-1 text-sm text-zinc-400; }
+  input, select, textarea { @apply w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-zinc-100 outline-none focus:border-blue-500; }
+  textarea { @apply min-h-24 font-mono text-xs; }
+  button { @apply rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50; }
+  table { @apply w-full border-collapse bg-zinc-900 text-left text-sm; }
+  th { @apply bg-zinc-950 px-4 py-3 font-medium text-zinc-400; }
+  td { @apply border-t border-zinc-800 px-4 py-3; }
+  td small { @apply block text-zinc-500; }
+  code { @apply font-mono text-xs text-blue-300; }
+  button.danger { @apply bg-red-950 text-red-300 hover:bg-red-900; }
+}

@@ -1,9 +1,10 @@
 pub mod app;
+pub mod client;
 pub mod config;
+pub mod control;
 pub mod cursor;
 pub mod error;
 pub mod model;
-pub mod prompting;
 pub mod provider;
 pub mod run;
 pub mod store;

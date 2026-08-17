@@ -1,4 +1,5 @@
 claude-server.tar
+.DS_Store
 dist
 .task
 bin
@@ -8,8 +9,12 @@ logs.zip
 frontend/bindings
 dist
 node_modules
+*.tsbuildinfo
 cursor-server.tar
 /cursor-server/target/
+/cursor-server/*.db
+/cursor-server/*.db-shm
+/cursor-server/*.db-wal
 server-node/cursor.tar
 server-go/cursor.tar
 server-go/log/

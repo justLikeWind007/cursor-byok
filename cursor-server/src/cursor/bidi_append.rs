@@ -2,13 +2,14 @@ use prost::Message;
 
 use crate::{
     cursor::proto::{agent::v1 as agent, aiserver::v1 as ai},
-    run::{RunCommand, RunRegistry},
+    cursor::{CursorCommand, CursorParent, CursorSessionRegistry},
     Error, Result,
 };
 
 pub async fn append(
-    registry: &RunRegistry,
+    registry: &CursorSessionRegistry,
     request: ai::BidiAppendRequest,
+    parent: Option<CursorParent>,
 ) -> Result<ai::BidiAppendResponse> {
     let request_id = request
         .request_id
@@ -29,17 +30,12 @@ pub async fn append(
     let payload = hex::decode(&request.data)
         .map_err(|error| Error::Protocol(format!("invalid BidiAppend hex: {error}")))?;
     let message = agent::AgentClientMessage::decode(payload.as_slice())?;
-    if let Some(agent::agent_client_message::Message::RunRequest(run)) = &message.message {
-        if let Some(conversation_id) = run.conversation_id.as_deref() {
-            registry
-                .bind_conversation(conversation_id, request_id)
-                .await;
-        }
+    let handle = registry.get_or_create(request_id).await?;
+    if let Some(parent) = parent {
+        handle.set_parent(parent)?;
     }
-    registry
-        .get_or_create(request_id)
-        .await?
-        .command(RunCommand::Append {
+    handle
+        .command(CursorCommand::Append {
             seqno: request.append_seqno,
             message: Box::new(message),
         })

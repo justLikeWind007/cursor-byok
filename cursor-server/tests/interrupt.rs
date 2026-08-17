@@ -6,27 +6,91 @@ mod fixtures;
 use std::sync::Arc;
 
 use cursor_server::{
+    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::{connect, proto::agent::v1 as pb},
-    prompting::{PromptAssets, PromptCompiler},
-    provider::{FinishReason, ResponseEvent},
-    run::{RunCommand, RunRegistry},
+    cursor::{CursorCommand, CursorSessionRegistry},
+    model::{ConversationId, ModelSpec, PreparedRun, PromptSpec, RunAction, RunId, RunKind},
+    provider::{FinishReason, ModelEvent},
+    run::RunRegistry,
+    store::RunStatus,
 };
 use prost::Message;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
-async fn a_new_revision_invalidates_late_events_from_the_old_run() {
+async fn generic_run_registry_cancels_the_previous_client_for_a_conversation() {
+    let registry = RunRegistry::default();
+    let conversation = cursor_server::model::ConversationId::new("conversation");
+    let first = CancellationToken::new();
+    let second = CancellationToken::new();
+    registry
+        .activate(
+            conversation.clone(),
+            cursor_server::model::RunId::new("first"),
+            first.clone(),
+        )
+        .await;
+    registry
+        .activate(
+            conversation.clone(),
+            cursor_server::model::RunId::new("second"),
+            second.clone(),
+        )
+        .await;
+
+    assert!(first.is_cancelled());
+    assert!(!second.is_cancelled());
+    registry
+        .release(&conversation, &cursor_server::model::RunId::new("first"))
+        .await;
+    registry.shutdown().await;
+    assert!(second.is_cancelled());
+}
+
+#[tokio::test]
+async fn a_replaced_run_cannot_overwrite_its_cancelled_status() {
     let (_directory, store) = fixtures::temp_store().await;
-    let first = store.begin_revision("conversation").await.unwrap();
-    let second = store.begin_revision("conversation").await.unwrap();
-    assert!(second > first);
+    let conversation_id = ConversationId::new("conversation");
+    let base_revision_id = store.ensure_conversation(&conversation_id).await.unwrap();
+    let prepared = |run_id: &str| PreparedRun {
+        run_id: RunId::new(run_id),
+        conversation_id: conversation_id.clone(),
+        kind: RunKind::Root,
+        model: ModelSpec::new("model"),
+        prompt: PromptSpec {
+            instructions: String::new(),
+            tools: Vec::new(),
+        },
+        selected_subagent_models: Vec::new(),
+        subagent_model_overrides: Vec::new(),
+        initial_messages: Vec::new(),
+        action: RunAction::Resume {
+            pending_tool_round: None,
+        },
+        base_revision_id,
+    };
+    let first = prepared("first");
+    let second = prepared("second");
+
+    store.claim_run(&first).await.unwrap();
+    store.claim_run(&second).await.unwrap();
     assert!(!store
-        .revision_is_current("conversation", first)
+        .finish_run(&first.run_id, RunStatus::Completed, None, None,)
         .await
         .unwrap());
-    assert!(store
-        .revision_is_current("conversation", second)
+
+    let status: String = sqlx::query_scalar("SELECT status FROM runs WHERE run_id = 'first'")
+        .fetch_one(store.pool())
         .await
-        .unwrap());
+        .unwrap();
+    let active: Option<String> = sqlx::query_scalar(
+        "SELECT active_run_id FROM conversations WHERE conversation_id = 'conversation'",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "cancelled");
+    assert_eq!(active.as_deref(), Some("second"));
 }
 
 #[tokio::test]
@@ -34,15 +98,15 @@ async fn registry_shutdown_cancels_runs_and_closes_run_sse_outputs() {
     let (_directory, store) = fixtures::temp_store().await;
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store,
         Arc::new(fake_provider::FakeProvider::default()),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let handle = registry.get_or_create("active-run").await.unwrap();
     let mut output = handle.subscribe();
@@ -63,34 +127,37 @@ async fn cancel_aborts_active_exec_before_canceled_end_stream() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     provider.push(vec![
-        ResponseEvent::ToolCallStart {
+        ModelEvent::Start {
+            model_call_id: "ignored".into(),
+        },
+        ModelEvent::ToolCallStart {
             index: 0,
             call_id: "call-1".into(),
             name: "Read".into(),
         },
-        ResponseEvent::ToolCallArgumentsDelta {
+        ModelEvent::ToolCallArgumentsDelta {
             index: 0,
             delta: "{\"path\":\"/tmp/a\"}".into(),
         },
-        ResponseEvent::ToolCallEnd { index: 0 },
-        ResponseEvent::Done(FinishReason::ToolUse),
+        ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Done(FinishReason::ToolUse),
     ]);
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store,
         Arc::new(provider),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let handle = registry.get_or_create("cancel-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
-        .command(RunCommand::Append {
+        .command(CursorCommand::Append {
             seqno: 0,
             message: Box::new(client_run()),
         })
@@ -103,12 +170,18 @@ async fn cancel_aborts_active_exec_before_canceled_end_stream() {
             .await
             .unwrap()
             .unwrap();
-        let (_, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        assert_eq!(
+            flags & connect::END_STREAM_FLAG,
+            0,
+            "Run ended before Exec: {}",
+            String::from_utf8_lossy(&payload)
+        );
         let server = pb::AgentServerMessage::decode(payload).unwrap();
         match server.message {
             Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno: append_seqno,
                         message: Box::new(kv_ack(kv.id)),
                     })
@@ -170,6 +243,10 @@ fn client_run() -> pb::AgentClientMessage {
                 }),
                 conversation_id: Some("cancel-conversation".into()),
                 run_id: Some("cancel-request".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "test-model".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )),

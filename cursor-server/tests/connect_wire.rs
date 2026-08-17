@@ -13,12 +13,12 @@ use axum::{
 };
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use cursor_server::{
+    cursor::prompting::{PromptAssets, PromptCompiler},
+    cursor::CursorSessionRegistry,
     cursor::{
         connect, handlers,
         proto::{agent::v1 as pb, aiserver::v1 as ai},
     },
-    prompting::{PromptAssets, PromptCompiler},
-    run::RunRegistry,
 };
 use flate2::{write::GzEncoder, Compression};
 use prost::Message;
@@ -96,15 +96,15 @@ async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     let (_directory, store) = fixtures::temp_store().await;
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store,
         Arc::new(fake_provider::FakeProvider::default()),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let wire = ai::BidiAppendRequest {
         request_id: Some(ai::BidiRequestId {
@@ -118,6 +118,7 @@ async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     let compressed = encoder.finish().unwrap();
 
     let response = handlers::router(registry)
+        .unwrap()
         .oneshot(
             Request::post("/aiserver.v1.BidiService/BidiAppend")
                 .header(header::CONTENT_TYPE, "application/proto")

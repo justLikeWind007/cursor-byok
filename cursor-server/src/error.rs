@@ -14,6 +14,8 @@ pub enum Error {
     Protocol(String),
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("store error: {0}")]
+    Store(String),
     #[error("run was cancelled")]
     Cancelled,
     #[error("run not found: {0}")]
@@ -37,14 +39,17 @@ pub enum Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
-            Self::Protocol(_) | Self::Decode(_) | Self::Json(_) => StatusCode::BAD_REQUEST,
+            Self::Config(_) | Self::Protocol(_) | Self::Decode(_) | Self::Json(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::RunNotFound(_) => StatusCode::NOT_FOUND,
-            Self::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Provider(_) | Self::Http(_) => StatusCode::BAD_GATEWAY,
             Self::Cancelled => StatusCode::CONFLICT,
-            Self::Database(_) | Self::Migration(_) | Self::Encode(_) | Self::Io(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Store(_)
+            | Self::Database(_)
+            | Self::Migration(_)
+            | Self::Encode(_)
+            | Self::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let code = match status {
             StatusCode::BAD_REQUEST => "invalid_argument",

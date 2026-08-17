@@ -7,39 +7,39 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use cursor_server::{
+    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::{
         connect,
         proto::{agent::v1 as pb, aiserver::v1 as ai},
     },
+    cursor::{CursorCommand, CursorSessionRegistry},
     model::{MessageContent, Role},
-    prompting::{PromptAssets, PromptCompiler},
-    provider::{FinishReason, ResponseEvent},
-    run::{RunCommand, RunRegistry},
+    provider::{FinishReason, ModelEvent},
     Error,
 };
 use prost::Message;
 
 #[tokio::test]
-async fn provider_failure_checkpoints_then_returns_structured_error_and_closes() {
+async fn provider_failure_keeps_the_initial_checkpoint_then_returns_structured_error() {
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     provider.push_error(Error::Provider("provider failed".into()));
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store.clone(),
         Arc::new(provider),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let handle = registry.get_or_create("failed-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
-        .command(RunCommand::Append {
+        .command(CursorCommand::Append {
             seqno: 0,
             message: Box::new(client_run()),
         })
@@ -47,7 +47,7 @@ async fn provider_failure_checkpoints_then_returns_structured_error_and_closes()
         .unwrap();
 
     let mut append_seqno = 1;
-    let mut saw_checkpoint = false;
+    let mut checkpoints = Vec::new();
     let mut saw_turn_ended = false;
     let error_json = loop {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(5), output.recv())
@@ -62,7 +62,7 @@ async fn provider_failure_checkpoints_then_returns_structured_error_and_closes()
         match server.message {
             Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno: append_seqno,
                         message: Box::new(kv_ack(kv.id)),
                     })
@@ -70,8 +70,8 @@ async fn provider_failure_checkpoints_then_returns_structured_error_and_closes()
                     .unwrap();
                 append_seqno += 1;
             }
-            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(_)) => {
-                saw_checkpoint = true;
+            Some(pb::agent_server_message::Message::ConversationCheckpointUpdate(state)) => {
+                checkpoints.push(state);
             }
             Some(pb::agent_server_message::Message::InteractionUpdate(update)) => {
                 if matches!(
@@ -88,7 +88,12 @@ async fn provider_failure_checkpoints_then_returns_structured_error_and_closes()
         }
     };
 
-    assert!(saw_checkpoint);
+    assert_eq!(
+        checkpoints.len(),
+        1,
+        "the initial user state is checkpointed"
+    );
+    assert!(checkpoints[0].pending_tool_calls.is_empty());
     assert!(!saw_turn_ended);
     assert_eq!(error_json["error"]["code"], "unavailable");
     let detail = &error_json["error"]["details"][0];
@@ -112,7 +117,12 @@ async fn provider_failure_checkpoints_then_returns_structured_error_and_closes()
         None
     );
 
-    let messages = store.load_messages("failed-conversation").await.unwrap();
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "failed-conversation",
+        ))
+        .await
+        .unwrap();
     assert!(messages.iter().any(|message| message.role == Role::User));
     assert!(!messages.iter().any(|message| {
         matches!(
@@ -127,32 +137,32 @@ async fn runtime_protocol_failure_returns_connect_error_end_stream_and_closes() 
     let (_directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     provider.push(vec![
-        ResponseEvent::Start {
+        ModelEvent::Start {
             model_call_id: "model-call".into(),
         },
-        ResponseEvent::ToolCallStart {
+        ModelEvent::ToolCallStart {
             index: 0,
             call_id: "call-1".into(),
             name: "Read".into(),
         },
-        ResponseEvent::ToolCallArgumentsDelta {
+        ModelEvent::ToolCallArgumentsDelta {
             index: 0,
             delta: "{\"path\":\"/tmp/a\"}".into(),
         },
-        ResponseEvent::ToolCallEnd { index: 0 },
-        ResponseEvent::Done(FinishReason::ToolUse),
+        ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Done(FinishReason::ToolUse),
     ]);
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store,
         Arc::new(provider),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let handle = registry
         .get_or_create("protocol-failed-request")
@@ -160,7 +170,7 @@ async fn runtime_protocol_failure_returns_connect_error_end_stream_and_closes() 
         .unwrap();
     let mut output = handle.subscribe();
     handle
-        .command(RunCommand::Append {
+        .command(CursorCommand::Append {
             seqno: 0,
             message: Box::new(protocol_client_run()),
         })
@@ -182,7 +192,7 @@ async fn runtime_protocol_failure_returns_connect_error_end_stream_and_closes() 
         match server.message {
             Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno: append_seqno,
                         message: Box::new(kv_ack(kv.id)),
                     })
@@ -193,7 +203,7 @@ async fn runtime_protocol_failure_returns_connect_error_end_stream_and_closes() 
             Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => {
                 // An unknown numeric bridge id is a runtime protocol error.
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno: append_seqno,
                         message: Box::new(pb::AgentClientMessage {
                             message: Some(pb::agent_client_message::Message::ExecClientMessage(
@@ -260,6 +270,10 @@ fn client_run() -> pb::AgentClientMessage {
                 }),
                 conversation_id: Some("failed-conversation".into()),
                 run_id: Some("failed-request".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "test-model".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )),
@@ -286,6 +300,10 @@ fn protocol_client_run() -> pb::AgentClientMessage {
                 }),
                 conversation_id: Some("protocol-failed-conversation".into()),
                 run_id: Some("protocol-failed-request".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "test-model".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )),

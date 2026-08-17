@@ -47,8 +47,8 @@ BidiAppend(request_id, append_seqno, data)
 | ID | 作用域 | 用途 |
 | --- | --- | --- |
 | `conversation_id` | 跨 Turn | 持久会话、最新 checkpoint、子会话 |
-| `request_id` | 一次 Run | 关联 RunSSE 与 BidiAppend |
-| `run_id` | 一次执行 | 当前样本中常与 `request_id` 相同，但不应假设永远相同 |
+| `request_id` | 一次具体执行/传输尝试 | 关联 RunSSE 与 BidiAppend；Cursor adapter 以它创建内部 RunId |
+| `run_id` | Cursor 逻辑 Run 元数据 | 普通样本中常与 `request_id` 相同；队列/子代理恢复时可能跨新 request 复用，不能作为执行表主键 |
 | `append_seqno` | 单个 request | Bidi 上行排序与去重 |
 | KV `id` | 单个 request | 配对 KV request/result |
 | Exec `id` | 单个 request | 配对本地执行 request/result |
@@ -78,6 +78,8 @@ BidiAppend(request_id, append_seqno, data)
 - 本轮可用的动态 request context；
 - `requested_model`、候选子 Agent 模型和模型覆盖；
 - 客户端能力位。
+
+`conversation_state` 的字段存在性不能用来判断是否已有历史。Cursor 在新对话中也会发送一个已分配但 roots 为空的 state；它表示空历史基线，首份 checkpoint 才写入 system root。只有 roots 非空的恢复历史才要求其中恰好存在一个 system prompt root。
 
 主会话首轮模型为 `grok-4.6`，参数为 `effort=high`、`fast=true`。首轮引用的 rules 为 1,114 字节、skills 为 5,207 字节、MCP 为 28,089 字节；空 subagents 使用 SHA-256 空串地址：
 
@@ -812,7 +814,7 @@ LLM 本身不保存会话。Loop 引擎反复把当前完整上下文投射成�
 ```text
 Provider SSE
 → OpenAI Chat / Responses / Anthropic Adapter
-→ Canonical ResponseEvent
+→ 统一 ModelEvent
 → Loop State Machine
 → Cursor AgentServerMessage
 → Connect RunSSE
@@ -825,13 +827,36 @@ start
 text_start / text_delta / text_end
 thinking_start / thinking_delta / thinking_end
 toolcall_start / toolcall_delta / toolcall_end
-done(stop | length | toolUse | error | aborted)
-error
+done(stop | length | toolUse)
+stream_error / cancellation
 ```
+
+其中 `error` 与 cancellation 是流错误和 Run 终态，不伪装成成功事件序列中的 `done(error/aborted)`；`length/incomplete` 也不是正常完成。
 
 模型端点差异只留在 Adapter。Loop、Blob、checkpoint 和 Cursor transport 不依赖具体 provider。
 
-### 16.3 RunSSE 的线格式
+### 16.3 上游调用的最小知识边界
+
+当前自然的数据流是：
+
+```text
+selected revision
+→ 纯 model/projection：canonical messages → typed history
+→ PromptSpec + ModelSpec + typed history = ModelRequest
+→ ModelInvocation(call_id + cancellation + ModelRequest)
+→ 固定 Provider adapter 的 request projector
+→ HTTP response headers → SSE decoder
+→ ModelEvent
+→ 严格 ModelCycle
+```
+
+`ModelRequest` 只保存可重放输入，不含 request id、时间、`model_call_id` 或 Cursor mode；调用 ID 和取消属于 `ModelInvocation`。每一轮都显式发送完整请求，不使用 `previous_response_id` 等服务端隐式会话作为上下文事实源。相同 PromptSpec、ModelSpec 和 selected revision 必须产生可比较的同一请求；下一 revision 只扩展旧历史前缀。
+
+Provider adapter 只认识 typed text/image/assistant/call/result 和自己的 endpoint JSON，不读 SQLite，不发 Cursor protobuf，不构造 checkpoint，也不执行工具。Chat、Responses、Anthropic 分别保存并回传自己的 reasoning replay state；跨端点不解码、不伪造。usage 的累计语义由各 adapter 在内部消化，对公共 ModelCycle 只发一次端点本轮最终可信总量；第二个 Usage 是协议错误，不能静默覆盖前值。缺失时保持缺失。
+
+同一个 CancellationToken 必须同时覆盖等待 HTTP 响应头和读取 SSE。若只在 SSE 建立后监听取消，新 Run 会无法及时中断仍卡在上游握手中的旧 Run。HTTP 非成功状态、裸 EOF、未闭合 content/tool block、`length/incomplete` 都是显式失败，不能 fallback 成正常 Done。
+
+### 16.4 RunSSE 的线格式
 
 `RunSSE` 虽然使用流式 HTTP，但正文不是浏览器式文本 `data: ...\n\n`。它是 Connect 流式二进制 envelope：
 
@@ -866,30 +891,31 @@ Runtime tag 虽然是实时产生的，但首次追加后也立即成为不可�
 
 `model_call_id` 只是一次模型调用的关联 ID，不是 provider 前缀缓存条件。跨模型时正常构造新请求即可，不应为了复用 `model_call_id` 改写历史。
 
+PromptSpec 只在单个 Run 内冻结。新 Run 切换模型或模式时，如果 system prompt 内容发生变化，Cursor checkpoint 应以新的内容寻址 Blob 替换 system root，同时复用其余历史 message roots；不能因为旧 system root 文本不同而拒绝对话。该请求自然进入新的模型/Prompt 缓存域，不要求跨模型共享缓存。上游 ModelRequest 始终使用本 Run 的 PromptSpec，旧 system root 只用于恢复时验证历史结构，不进入 canonical messages。
+
 ### 17.2 Tool call/result 的完整性约束
 
-工具可以并行执行并乱序完成，但下一次模型调用不能看到悬空 tool call。内部状态应把每个调用和结果一对一关联：
+工具可以并行执行并乱序完成，但下一次模型调用不能看到悬空 tool call。每个完成结果以一组相邻消息原子提交：
 
 ```text
-ToolBatch
-├─ slot 0: call0 ↔ result0
-├─ slot 1: call1 ↔ result1
-└─ slot 2: call2 ↔ result2
+assistant(call3) → tool(result3)
+assistant(call1) → tool(result1)
+assistant(call0) → tool(result0)
 ```
 
-只有当前模型产生的 Tool Batch 全部具有可投射结果后，才能构造下一轮 provider request。该约束保证相同 committed state 总能产生相同请求。
+这里的 pair 顺序就是真实 `completion_seq`，不为恢复原始 call 顺序而阻塞已完成工具。只有当前模型产生的 ToolRound 全部具有可投射结果后，公共 projector 才按 durable ToolRoundId 折叠成一个 assistant batch；assistant 内 calls 恢复 Provider 原始 index，随后的 result messages 保持 completion_seq。该约束保证相同 committed revision 总能产生相同请求。
 
 抓包中的模型 transcript 采用 AI SDK/OpenAI Chat 风格：
 
 ```text
 assistant: [call0, call1, call2, call3]
-tool: result0
 tool: result1
-tool: result2
 tool: result3
+tool: result2
+tool: result0
 ```
 
-真实执行完成顺序为 `result1、result3、result2、result0`，但最终持久化顺序恢复成原始 call 顺序。这里的“一对一”是语义配对和原子投射约束，不要求所有 provider 都使用字面上的 `call0,result0,call1,result1` 排列；具体线格式由端点 Adapter 决定。
+这里的“一对一”是语义配对、相邻原子提交和整批完整性约束，不要求 result 与 call index 同序；具体线格式由端点 Adapter 决定。
 
 ## 18. Tool 流事件与客户端占位卡片
 
@@ -932,7 +958,7 @@ tool name
 → execution delta/result mapper
 ```
 
-## 19. Checkpoint 的时机与单 Tool 回滚
+## 19. Checkpoint 的时机与 ToolRound 恢复
 
 ### 19.1 Checkpoint 是可恢复提交，不只是 UI 快照
 
@@ -963,35 +989,52 @@ checkpoint pending=1
 
 但抓包中的四工具样本没有把第一个完成结果单独写进 Turn。第一个 `tool_call_completed` 后发出的 checkpoint 仍只有 Thinking 和 Assistant 两个 Step；等四个工具全完成后，四个 Tool Step 才一起进入新 Turn。因此当前样本能恢复到“工具批次正在执行”，不能恢复到“其中某一个工具已经完成且结果已持久化”。
 
-### 19.3 服务端目标：单 Tool 粒度
+### 19.3 服务端目标：忠实实现 ToolRound 粒度
 
-为了避免崩溃后重复执行写文件、shell、MCP 等有副作用的工具，服务端实现应提高到单 Tool 粒度。每个 call 使用固定 slot，完成状态可以和其他工具交叉：
-
-```text
-slot[0] = call0 pending
-slot[1] = call1 completed(result1)
-slot[2] = call2 pending
-```
-
-建议两个提交点：
+服务端不能以“减少副作用重放”为理由发明抓包中不存在的部分完成 checkpoint。正确提交点只有两个：
 
 ```text
-Tool 参数完整
-→ 持久化 Tool Intent
-→ Blob 确认
-→ checkpoint(call=pending)
-→ 才向客户端发 ExecServerMessage
+Provider 完整结束为 tools
+→ 原子保存 ToolRound assistant 与全部有序 calls
+→ checkpoint(stable roots 不变，pending assistant = 1)
+→ 执行工具
 
-Tool Result 返回
-→ 服务端本地 SQLite 先记 working state
-→ 生成 Result JSON Blob、Completed Tool Step Blob、新 Turn Blob
-→ Blob 确认
-→ checkpoint(call=completed)
+每个 Tool Result 到达
+→ 按真实完成顺序原子追加 assistant(call) → tool(result)
+→ 中间结果不发布 checkpoint
+→ 最后一个结果使 ToolRound settled
+→ Blob SET/ACK
+→ checkpoint(assistant batch + 全部 results 进入 stable roots，pending = 0)
+→ 下一轮 LLM
 ```
 
-Checkpoint 可以记录部分完成的 Tool Batch，但 LLM Projector 仍须等待整批 call/result 完整，不能把部分完成状态投射为下一轮模型请求。这样同时满足单 Tool 回滚与 LLM tool protocol 完整性。
+SQLite 的 durable ToolRound 可以记录单 call 完成状态，用于进程内一致性和诊断；它不是客户端已经持有的恢复点。Cursor 自动恢复只以客户端下一次带回的 eligible checkpoint 为事实，因此 staged 状态中断后会重新执行整批工具。若未来要避免某类副作用重复执行，需要新的 wire 证据或客户端幂等键，不能把部分 ToolResult 塞进当前 checkpoint 语义。
 
-## 20. Blob 确认、重试与 Checkpoint 送达
+### 19.4 当前版本复核：exchange 9005 与 Cursor.app
+
+当前 Cursor `3.16.17` 的完整 exchange `9005` 给出更精确的序列。frame `467/493/504/526/543/565/579/613/625/1643/1644/1645` 的 `(stable roots, pending)` 依次为：
+
+```text
+(31,0) → (31,1) → (35,0)
+→ (35,1) → (39,0)
+→ (39,1) → (43,0)
+→ (43,1) → (48,0)
+→ (48,1) → (49,0) → (49,0)
+```
+
+四个 ToolRound 的 settled checkpoint 都严格早于下一轮首个模型 interaction：`504 < 505`、`543 < 544`、`579 < 580`、`625 < 626`。这证明 settled checkpoint 是继续 Loop 前的 client-state barrier，但不代表存在 wire checkpoint ACK；protobuf 只有 Blob SET 的 `set_blob_result(id)`。
+
+最终新 Blob 位于 RunSSE frame `1638..1641`，分别是 thinking Step、assistant Step、更新后的 Turn wrapper 和 assistant root JSON；同一 request 的 Bidi `id=122..125` 都返回成功 SET result。RunSSE 随后是 frame `1642` 的 `turn_ended`，再是 `1643..1645` 的 staged、settled、相同 settled 重发。抓包数据库没有保存两条独立 HTTP 流中每个 frame 的统一时间戳，因此不能仅凭 frame index 声称 ACK 与 `turn_ended` 的跨流先后；能够确认的是四个 ACK 均在 RunSSE 结束前到达。实现采用更强且确定的安全屏障：这四个新增 Blob 全部 ACK 后才解除 final state barrier，并发送 `turn_ended`/checkpoint。三份终局 checkpoint 的最后一个 Turn BlobID 相同，因此终局 presentation delta 只能消费一次。
+
+Cursor.app 的运行代码把 `turn_ended` 前的 checkpoint 标为 `eligible`，之后标为 `ineligible_terminal_turn`。断流恢复会带回最新 eligible state 并改用 `resume_action`；若该 state 含完整 pending assistant，服务端恢复 ToolRound 并先执行工具，不得再次调用 LLM。`pendingToolCallStartedAtMs`、未知 reasoning signature 和旧 Step 时间都必须原样保留。
+
+这个标记发生在客户端消费帧时，因此 `turn_ended` 与第一份终局 checkpoint 之间存在一个很窄的断流窗口：客户端已见 `turn_ended`，但还没有见 `ineligible_terminal_turn`，此时仍可能用上一份 eligible checkpoint 重试。这不改变协议顺序，也不构成 checkpoint ACK 的理由；服务端只能以下一次 `run_request` 实际带回的 state 为准。
+
+stable root JSON 的 wire `id` 也不是内部身份：同一 exchange 的四个不同 assistant 工具批次都使用字符串 `"1"`，tool result root 的 `id` 等于 `toolCallId`。内部 MessageId/ToolRoundId 必须从 BlobID、序位和 durable round 产生，不能按 wire id 合并。
+
+checkpoint 的非 canonical 元数据并非全部冻结。exchange `9005` 的 `read_paths` 随成功 Read 从 11 项增加到 12 项；Todo/Plan/UpdateCurrentStep 也由 typed completion 或 canonical messages 确定性推进。`token_details.used_tokens` 是当前一次完整模型上下文的占用，不等于整个 Turn 的累计 provider input。服务端以最后一次 provider 调用返回的 `input_tokens + output_tokens` 更新它；`max_tokens` 来自 Cursor 既有 checkpoint 或请求模型的 `context` 参数。breakdown 的分类值是展示估算，不冒充 provider usage，但其 token 合计必须严格等于权威 `used_tokens`。
+
+## 20. Blob 确认与 Checkpoint 送达
 
 ### 20.1 Blob SET 的确认语义
 
@@ -1012,7 +1055,7 @@ message SetBlobResult {
 
 `SetBlobResult {}` 表示成功，带 `error` 表示失败。当前完整 exchange 372 中 154 个 `set_blob_args` 对应 154 个无错误 `set_blob_result`，成功样本没有发现缺失确认。
 
-BlobID 是内容哈希，所以重发同一个 `blob_id + blob_data` 是幂等操作。KV `id` 用于匹配一次尝试；同一 Blob 可以在超时后以新的 KV `id` 重试，迟到或重复结果按 BlobID 合并为已确认状态。
+BlobID 是内容哈希，因此相同内容天然得到相同 ID；但当前会话协议仍把每次 SET 表达为唯一 KV `id` 对应唯一 `set_blob_result`。实现不在超时后生成新 KV id 重试同一 Blob，也不合并迟到尝试。
 
 服务端应区分：
 
@@ -1021,7 +1064,7 @@ Working State：结果已经到达服务端，但客户端 Blob 是否持久化�
 Committed Checkpoint：只引用已经得到成功确认的 Blob
 ```
 
-如果某个确认暂时没有返回，不应把它立即判为写入失败，也不能发布引用该 Blob 的 checkpoint。继续保持 working state、重试内容寻址写入，并保留上一个 committed checkpoint。
+如果确认在配置的等待期限内没有返回，当前 checkpoint job 失败，并进入该 Run 的 typed Error/取消生命周期；绝不能发布引用该 Blob 的 checkpoint，也不保存跨 RunSSE working/outbox 等待以后续传。
 
 候选 checkpoint 不必等待与它无关的所有 Blob，只需要满足：
 
@@ -1034,7 +1077,7 @@ Checkpoint C 可以发布
 
 抓包中 `turn_ended` 后可能先发送一个过渡 checkpoint，随后相同的稳定最终 checkpoint 连续发送两到三次，最后才发送 Connect EndStream。exchange 372 的尾部是 `pending=1` 的过渡 checkpoint，接着两次 `roots=59、pending=0` 的相同最终 checkpoint。正常未断流的 RunSSE 是有序可靠字节流：客户端如果收到了后面的 EndStream，就一定先收到了位于它之前的完整 checkpoint 帧。因此在正常完成路径上，可以断言最终 checkpoint 已经通过 RunSSE 送达客户端，不需要额外 checkpoint ACK 才结束。
 
-需要严格区分“传输送达”和“应用层确认”：协议没有单独的 `checkpoint_ack`。重复帧说明客户端必须幂等接受相同 checkpoint，也增强了尾部发送的稳健性，但仅凭重复本身不能证明断线之后客户端已经持久化了哪一份状态。断流时应以客户端下一次 `run_request` 实际带回的 checkpoint 为恢复事实，并从服务端 SQLite working/outbox 状态继续同步。
+需要严格区分“传输送达”和“应用层确认”：协议没有单独的 `checkpoint_ack`。重复帧说明客户端必须幂等接受相同 checkpoint，也增强了尾部发送的稳健性，但仅凭重复本身不能证明断线之后客户端已经持久化了哪一份状态。断流时只以客户端下一次 `run_request` 实际带回的 checkpoint 为恢复事实；服务端不重放旧 RunSSE 帧，也不从不存在的 outbox 猜测客户端状态。
 
 ## 21. Usage 与 Turn 收口
 
@@ -1058,7 +1101,32 @@ message TurnEndedUpdate {
 }
 ```
 
-最小实现不需要生成 `token_delta`。权威 usage 只信任各 LLM Adapter 从 provider 最终事件读取到的值：不根据文本 delta 自己 tokenize，不推算 cache token，也不推算 reasoning token。provider 未返回的可选字段保持缺失。
+exchange `9005` 明确包含 378 个 `token_delta`，合计 5022；它们穿插在 thinking、text、tool/exec 流事件之间。该流最终的 `turn_ended` 是 `input=388564、output=5870、cache_read=346112、reasoning=2736`，因此 `token_delta` 既不是 Turn input，也不是最终 output 的逐块拆分。checkpoint 的 `used_tokens` 同时从 35302 前进到 44492，`max_tokens=256000`。三者职责必须分开：
+
+```text
+token_delta              生成期间供 Cursor UI 增量刷新
+checkpoint.token_details 当前上下文占用/上限
+turn_ended               整个 Run 的 provider 权威累计量
+```
+
+通用 provider 端点通常只在流末给出可信 token 数，无法复现 Cursor 私有服务逐 chunk 的估算。当前实现因此在每次模型调用的 terminal Usage 到达时发送一个 `token_delta(output_tokens)`，不根据文本、thinking 或工具参数自行 tokenize；随后用该次调用的 `input_tokens + output_tokens` 更新 checkpoint。这样 UI 会更新，数值仍全部来自 provider，只是刷新粒度为一次模型调用而非每个 chunk。
+
+同一抓包还证明 breakdown 不是把权威总量按比例平摊。六个非对话分类在所有 checkpoint 中保持固定：
+
+| id | label | character_count | estimated_tokens |
+| --- | --- | ---: | ---: |
+| `system_prompt` | System prompt | 3372 | 920 |
+| `tools` | Tool definitions | 40174 | 10965 |
+| `rules` | Rules | 7684 | 2097 |
+| `skills` | Skills | 6305 | 1720 |
+| `mcp` | MCP & dynamic tools | 11916 | 3252 |
+| `subagents` | Subagent definitions | 3413 | 931 |
+
+`summarized_conversation` 在该样本为零；`conversation` 随消息增长，并取得 `used_tokens` 扣除其他分类估算后的剩余值。例如最终 `used_tokens=44492`，其他分类合计 19885，故 conversation 恰为 24607。实现遵守同一结构：按实际投射内容分别统计 UTF-16 `character_count`；system prompt、静态工具、rules、skills、动态 MCP、subagent 和已有 summary 独立估算；普通 user/assistant/tool 内容进入 conversation；最后由 conversation 吸收权威总量的余数。若分类估算异常超过权威总量，则只按最大余数法压缩非 conversation 分类，保证八类非负且总和始终精确。
+
+分类边界来自实际数据流而不是工具名猜测：静态 prompt 和 ToolDefinition 由当前 PromptSpec 提供，动态 MCP ToolDefinition 进入 `mcp`，只有 `origin=runtime` 的消息才解析其中明确的 `<rules>`、`<agent_skills>`、`<subagents>`、`<mcp_meta_tools>` 区段；用户正文即使含相似文本也仍属于 conversation。分类估算器按 Cursor/JavaScript 的 UTF-16 字符口径统计，ASCII 使用每字符约 `0.273` token、非 ASCII 使用每 UTF-16 code unit 约 `0.55` token；这只决定分类分布，不改变 provider 权威总量。当前抓包的 `prompt_context_usage_tree` 为空，因此只生成已被证实的八类 breakdown，不编造 tree/node 或 snapshot Blob。
+
+权威 usage 只信任各 LLM Adapter 从 provider 最终事件读取到的值：不推算 cache token，也不推算 reasoning token。adapter 可读取多个端点累计快照，但必须先汇总并只交付一个 terminal total；公共状态机收到重复 Usage 直接失败。provider 未返回的可选字段保持缺失。
 
 `turn_ended` 表达整个 Cursor Run/Turn 的汇总，而不是一次 provider 调用。exchange 372 的最终值为：
 
@@ -1072,14 +1140,15 @@ reasoning_tokens   = 5004
 
 `input_tokens` 已明显超过单次 256K 上下文，证明它是同一 Run 内多次 LLM 调用的累计值。实现时只对 provider 返回的可信调用总量求和，然后在最终 `turn_ended` 一次汇报。
 
-最终收口顺序建议为：
+当前实现的固定收口顺序为：
 
 ```text
 最终 provider done(stop)
 → 最终 text_delta / step_completed
-→ SET 最终 assistant JSON / Step / Turn Blob
+→ 构造并 SET 最终 assistant JSON / Step / Turn Blob
+→ 等待这些新增 Blob 的配对 SET ACK
 → turn_ended(整轮可信 usage 总量)
-→ 等待所引用 Blob 成功确认并发送过渡 checkpoint（如果需要）
+→ 发送 pending=1 的过渡 checkpoint
 → final checkpoint(pending=0)
 → 幂等重复 final checkpoint
 → Connect EndStream
@@ -1186,7 +1255,7 @@ request_id      → 一次 Run/传输尝试
 RunSSE          → request_id 的下行通道
 ```
 
-当前抓包没有 abort/error 尾部，因此异常路径只能作为实现约束：用户打断时取消旧 provider 和尚未继续的工具，提交最后安全 checkpoint，以 canceled/aborted EndStream 结束旧 Run；不能伪造正常成功的 `turn_ended`。单纯的 RunSSE 断线也不等于 Turn 已结束，恢复事实应来自客户端下一次带回的 checkpoint。
+当前抓包没有 abort/error 尾部，因此异常路径只能作为实现约束：用户打断时取消旧 provider 和尚未继续的工具，保留此前已经发布的最后安全 checkpoint，不再为取消制造新 checkpoint，并以 canceled/aborted EndStream 结束旧 Run；不能伪造正常成功的 `turn_ended`。单纯的 RunSSE 断线也不等于 Turn 已结束，恢复事实应来自客户端下一次带回的 checkpoint。
 
 ## 23. Runtime tag：运行时产生、严格追加一次
 
@@ -1291,54 +1360,80 @@ CreatePlan 参数/成功结果 → 更新 current_plan 投影
 
 ## 25. 多模式 Prompt 与 Tool 资产
 
-`main` 分支已有完整的静态 prompt、模式工具定义和 reminder 模板。已将其中 18 个语言无关资产原样复制到当前分支的 `prompt/`：
+当前静态资产已经收敛到 `prompt/cursor/`。完整工具 schema 只有根目录一个 catalog，各模式只保存有序 manifest；共享 schema 不在不同模式间复制：
 
 ```text
-prompt/
-├─ common_prefix.md
-├─ agent/       prompt.md + tools.json
-├─ ask/         prompt.md + tools.json
-├─ plan/        prompt.md + tools.json + system_reminder.txt
-├─ debug/       prompt.md + tools.json + initial/continuing reminder
-├─ multitask/   prompt.md + tools.json
-├─ subagent/    prompt.md + tools.json
-├─ compaction/  prompt.md
-└─ commit/      prompt.md
+prompt/cursor/
+├─ tools.json                  # 完整 schema catalog + Task.subagent variant
+├─ modes/                      # 每个模式的有序工具 manifest
+│  ├─ agent.json
+│  ├─ ask.json
+│  ├─ plan.json
+│  ├─ debug.json
+│  ├─ multitask.json
+│  ├─ subagent.json
+│  └─ compaction.json
+├─ agent/
+│  ├─ prompt.md                 # 静态 system prompt
+│  └─ runtime.md                # 本模式的 user-role runtime 模板
+├─ ask/{prompt.md,runtime.md}
+├─ plan/{prompt.md,runtime.md}
+├─ debug/{prompt.md,runtime.md}
+├─ multitask/{prompt.md,runtime.md}
+├─ subagent/{prompt.md,runtime.md}
+└─ compaction/{prompt.md,runtime.md}
 ```
 
 工具数量：
 
 | 模式 | Tools |
 | --- | ---: |
-| Agent | 21 |
-| Ask | 19 |
-| Plan | 17 |
-| Debug | 19 |
-| Multitask | 21 |
-| Subagent | 4 |
+| Agent | 20 |
+| Ask | 15 |
+| Plan | 13 |
+| Debug | 15 |
+| Multitask | 17 |
+| Subagent | 20 |
+| Compaction | 0 |
 
 Rust 服务端应在启动时加载、解析并校验这些资产：
 
 ```rust
 struct ModeAssets {
-    system_prompt: Arc<str>,
+    prompt: Arc<str>,
+    runtime: Arc<str>,
     tools: Arc<[ToolDefinition]>,
-    runtime_reminders: Arc<[RuntimeTemplate]>,
 }
 ```
 
-模式映射：
+模式映射和消费规则：
 
 ```text
-AGENT_MODE_AGENT      → common prefix + agent prompt/tools
-AGENT_MODE_ASK        → common prefix + ask prompt/tools
-AGENT_MODE_PLAN       → common prefix + plan prompt/tools/reminder
-AGENT_MODE_DEBUG      → debug prompt/tools + initial/continuing reminder
-AGENT_MODE_MULTITASK  → common prefix + multitask prompt/tools
-子 Agent conversation → subagent prompt +受限 tools
+UserMessage.mode      → 当前 Run 的 prompt.md + runtime.md + tools manifest
+conversation_state.mode → 仅给没有 UserMessage.mode 的后台完成等动作提供模式
+subagent_type_name    → 明确选择 subagent 资产
 ```
 
-静态 prompt 和工具目录按 mode 选择；运行时 reminder 必须遵守第 23 节的 exactly-once append，不能因为每轮加载同一个模板而重复加入 messages。模式或工具集合切换可以形成新的 provider cache 边界，但已提交的模型 messages 仍然保持严格只追加。
+不能用恢复出来的 `conversation_state.mode` 覆盖当前 `UserMessage.mode`；否则 UI 刚切换 Ask/Plan/Debug/Multitask 时，本轮仍会用旧模式的 prompt 和 tools。也不使用目录别名或缺失资产 fallback：每个可用模式都必须显式维护自己的 `prompt.md` 和 `runtime.md`，缺失或模板占位符非法时服务启动失败。
+
+`runtime.md` 是一次性渲染的 Markdown 模板。通用占位符为：
+
+```text
+{{REQUEST_CONTEXT}}
+{{OPEN_FILES}}
+{{SELECTED_CONTEXT}}
+{{ACTION_CONTEXT}}
+{{TIMESTAMP}}
+{{USER_QUERY}}
+```
+
+Debug 额外使用 `{{DEBUG_SERVER_ENDPOINT}}`、`{{DEBUG_LOG_PATH}}` 和 `{{DEBUG_SESSION_ID}}`。模板必须包含 `TIMESTAMP` 和 `USER_QUERY`；其他区块完全取决于当前 RunRequest：有数据就加入，没有就渲染为空，不从历史猜测，不制造空标签，不使用默认内容托底。渲染是单遍替换，用户文本中恰好出现 `{{...}}` 不会被当成第二层模板执行。
+
+当前请求的 `RequestContextRulesPart`、`RequestContextSkillsPart`、`RequestContextSubagentsPart` 和 `RequestContextMcpsPart` 先按 BlobID 取回，校验 hash 和 byte length，再按明确 protobuf 类型解码；缺 Blob、长度不符或类型错误都是协议错误，不能忽略。公共请求上下文按抓包顺序编译为 `user_info → git_status → agent_transcripts → rules/skills/subagents/MCP`，后四类同样只在当前请求携带时出现。
+
+每个携带用户语义的 RunRequest 最终只产生一条 `role=user, origin=runtime` 的 canonical message：模式 reminder、当前请求上下文、时间、`user_query` 和图片都在同一条 message 中。原始 `UserMessage.text` 不再另行投射，避免同一用户问题出现两次。该 message 以 `run-request:{request_id}` 作为 runtime event identity，在 Start 或 Resume 进入 provider 前与 messages 一起持久化；恢复和 provider 重试只能重放已持久化文本，不能重新取时间或重新渲染。
+
+静态 prompt 和工具目录按 mode 选择；运行时 message 必须遵守第 23 节的 exactly-once append。模式或工具集合切换可以形成新的 provider cache 边界，但已提交的模型 messages 仍然保持严格只追加。
 
 
 
@@ -1355,7 +1450,7 @@ BidiAppend.run_request
 → 投射 RunSSE 流事件
 → 客户端执行 Tool
 → BidiAppend 返回结果
-→ 单 Tool checkpoint
+→ ToolRound settled checkpoint
 → 下一轮 LLM
 → turn_ended
 → final checkpoint
@@ -1367,7 +1462,7 @@ Runtime event 恰好追加一个 runtime-origin/user-role message。
 Provider 重试只重放，不能重复追加任何 message。
 Tool call/result 必须一对一完整，不能向 LLM 投射悬空调用。
 Tool 可以乱序完成，但下一轮 LLM 必须等待整个 Tool Batch 完整。
-每个 Tool 单独持久化和 checkpoint，避免有副作用工具被重复执行。
+每个 Tool Result 单独原子持久化，但只在整个 ToolRound staged/settled 边界发布 checkpoint。
 Blob 先确认，checkpoint 后发布。
 turn_ended、final checkpoint、EndStream 是三个独立边界。
 Usage 只信任 provider，最终按整个 Turn 汇总。
@@ -1484,29 +1579,28 @@ is_expected                  = false
 成功路径：
 
 ```text
-业务消息
-→ Blob SET / ACK barrier
-→ turn_ended + final checkpoint
+最终 assistant revision 提交
+→ staged/settled 所需 Blob SET / ACK barrier
+→ turn_ended
+→ staged pending=1
+→ settled pending=0
+→ 幂等重发同一 settled
 → EndStream {}
 → 关闭 RunSSE 输出
 ```
 
-真实抓包的客户端可见尾序列是 `turn_ended → 重复 final checkpoint → EndStream {}`。`main` 分支现有 Go 实现是 `Blob ACK → checkpoint → turn_ended → EndStream {}`；两者的最终语义相同，但 Rust 的协议兼容测试应固定所采用的客户端可见顺序。
+真实抓包稳定呈现 `turn_ended → staged → settled → settled 重发 → EndStream {}`。Cursor.app 将 `turn_ended` 之前的 checkpoint 视为 eligible，将其后的终局快照视为 `ineligible_terminal_turn`；这些顺序不能因“最终语义相同”而交换。
 
 Provider 失败路径：
 
 ```text
 停止 provider
-→ 保存已经收到并确认的部分 assistant 输出
 → 保存 provider 已汇报的 usage 与失败元数据
-→ 从当前已提交 messages 构造 checkpoint
-→ Blob SET / ACK barrier
-→ 发布 checkpoint
 → Error EndStream
 → 关闭 RunSSE 输出
 ```
 
-失败路径不发送 `turn_ended`，不发送错误 `TextDelta`，也不把错误字符串追加为 assistant message。已经作为正常 provider delta 发出的部分内容可以保留；错误本身只存在于 run 元数据和 Connect error 中。若在 checkpoint Blob 同步失败时采用超时策略，可以跳过未获确认的 checkpoint，但仍必须发送 Error EndStream，不能让流永久悬挂。
+失败路径不发送 `turn_ended`，不发送错误 `TextDelta`，不把错误字符串或半截 assistant 追加进 canonical messages，也不伪造新的成功 checkpoint；失败前已经发布的 initial/settled checkpoint 仍然有效。已经发送到 UI 的 partial text/thinking 只作为诊断展示；错误本身进入 Run 元数据和 Connect error。checkpoint Blob 构造或 ACK 失败同样直接进入 Error 生命周期。
 
 用户取消或新 Run 打断旧 Run：
 
@@ -1518,7 +1612,7 @@ Provider 失败路径：
 → 关闭旧 RunSSE 输出
 ```
 
-取消不发送 `turn_ended`，也不发布一个代表成功完成的新 checkpoint。Cursor 对 Connect `canceled` 有专门处理，不应将它显示为普通错误。已在更早的单 Tool checkpoint 中确认的副作用和消息保持有效；未完成工具不能投射进下一轮 LLM。
+取消不发送 `turn_ended`，也不发布一个代表成功完成的新 checkpoint。Cursor 对 Connect `canceled` 有专门处理，不应将它显示为普通错误。此前已经发布的 settled ToolRound checkpoint 保持有效；尚未 settled 的工具批次不能投射进下一轮 LLM。
 
 ### 26.5 统一终结不变量
 
@@ -1591,13 +1685,13 @@ RunRegistry
 
 下发 Exec 前在内存中建立 `id → call_id`，客户端结果到达时用 `message.id` O(1) 查找，不查 SQLite。数字 ID 在整个 request 内单调递增，条目在 result/exit 到达后标记为 `ResultReceived`，在随后的 `stream_close` 到达时删除。Run 取消或失败时对仍为 `Running` 的 ID 发送 abort，然后清空全部条目。
 
-这个映射是运行期协议状态，不是上下文事实源。SQLite 只保存已经关联成功的 `run_tool_results` 和 checkpoint，不参与每个 Shell 流片段的实时查找。
+这个映射是运行期协议状态，不是上下文事实源。SQLite 只在 durable `tool_round_calls` 中保存已经关联成功的 ToolResult，不参与每个 Shell 流片段的实时查找；checkpoint 也不是 SQLite 中的第二份会话状态。
 
-客户端会在 result/exit 之后紧接着发送 `stream_close`。因此 `run_tool_results` 的持久化不能使用“事务内先 SELECT completion_seq，再将 deferred transaction 升级为写事务”的方式，它会和 Bidi `append_seqno` 的并发更新产生 `SQLITE_BUSY_SNAPSHOT`。completion_seq 的计算和 ToolResult 插入必须合并为单条原子 `INSERT ... SELECT`。
+客户端会在 result/exit 之后紧接着发送 `stream_close`。ToolResult 的 completion_seq、call 状态、assistant/result message pair、ToolRound version 和新 revision 必须在同一个 immediate transaction 中推进，不能先读序号再把 deferred transaction 升级为写事务，否则会留下竞态或 `SQLITE_BUSY_SNAPSHOT`。
 
 ### 26.8 ToolResult 向 LLM 的字符串投射
 
-Canonical `ToolResult.output` 允许保存任意 JSON Value，因为 Todo/Plan fold、checkpoint 和调试都需要保留工具结果的结构。但是投射到 LLM 请求时，ToolResult content 必须始终是字符串，不能把 JSON object、array、number、boolean 或 null 直接放入 message content。这是所有 provider adapter 的共同输入不变量，不应由 OpenAI Chat、Responses 或 Anthropic 各自补救。
+Canonical `ToolResult.content` 本身就是字符串。adapter 在 typed Cursor 结果进入核心之前只做一次规范化：文本原样保存，结构化结果用确定性的 JSON 序列化保存。OpenAI Chat、Responses 和 Anthropic 因而都读取同一个 String，不在各端点重复猜测 JSON 类型。
 
 已观测的失败是 `TodoWrite` 将对象结果持久化后，projector 直接生成：
 
@@ -1620,12 +1714,13 @@ OpenAI Chat 因此拒绝 `messages[7]`，报错 `content should be a string or a
 统一规则：
 
 ```text
-output 是 JSON string → 直接使用原字符串，不二次加引号
-output 是其他 JSON 类型 → serde_json::to_string(output)
-最终 ProviderMessage.content → 始终 Value::String
+typed terminal result
+→ Cursor adapter 生成 String ToolResult.content
+→ SQLite/canonical message 原样保存该 String
+→ Provider adapter 按本端点的 tool-result 字段放入同一个 String
 ```
 
-字符串化只发生在 `CanonicalMessage → ProviderMessage` 边界；SQLite、Blob 和 derived state 仍保留原始结构化 JSON。这样既满足 LLM 端点约束，又不破坏幂等状态投影。
+Todo/Plan/UpdateCurrentStep 等派生状态需要结构时，从已知工具的字符串 content 严格解析自己的 JSON schema；解析失败是协议错误或表示该工具没有可派生状态，不能把 canonical 类型重新放宽成任意 Value。这样 core 与 Provider 都不需要知道 Cursor protobuf。
 
 ### 26.9 Thinking 历史的端点投射
 
@@ -1640,12 +1735,13 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 公共投射必须保持中性结构：
 
 ```text
-ProviderMessage
-├─ content  = assistant text
-└─ thinking = assistant thinking
+ProjectedMessage::Assistant
+├─ text          = 可展示 assistant text
+├─ thinking      = 可展示 thinking summary
+└─ replay_state  = 端点产生的不透明续传状态
 ```
 
-具体 provider adapter 再负责端点字段映射。OpenAI Chat 必须生成：
+具体 provider adapter 再负责端点字段映射。OpenAI Chat 只有在 replay state 的 `provider_kind=openai_chat` 且其中确实包含 `reasoning_content` 时才生成：
 
 ```json
 {
@@ -1656,10 +1752,9 @@ ProviderMessage
 }
 ```
 
-DeepSeek 官方文档进一步明确了这里不是“字段存在即可”的校验：
+DeepSeek 的 Chat 兼容端点进一步明确了这里不是“字段存在即可”的校验：
 
-- 未调用工具的 assistant thinking，在后续请求中可以不回传；即使回传也会被忽略。
-- 只要 assistant 调用了工具，该次模型响应的 `reasoning_content` 就必须完整、原样参与后续请求。
+- 只要 assistant 调用了工具，该次模型响应的 `reasoning_content` 就必须完整参与后续请求。
 - 官方示例直接追加完整的 `response.choices[0].message`，即同一条 assistant message 同时包含 `content`、`reasoning_content` 和该次响应的全部 `tool_calls`。
 - 用 `reasoning_content: ""` 给拆分出的 assistant tool-call message 补字段不是正确修复；它仍然丢失了原始思维内容。
 
@@ -1670,7 +1765,7 @@ DeepSeek 官方文档进一步明确了这里不是“字段存在即可”的�
 ```text
 Cursor 持久化与 checkpoint 视图
 assistant(call 1) → tool result 1 → assistant(call 2) → tool result 2
-                  单工具完成、单工具 checkpoint
+                  单结果原子提交；ToolRound 完整后 settled checkpoint
 
 LLM provider 请求视图
 assistant(
@@ -1685,11 +1780,12 @@ assistant(
 服务端继续按已完成工具保存 1:1 pair，因此中断时不会把尚未得到结果的 tool call 投射给下一次 LLM。每条 canonical assistant tool message 额外保存：
 
 ```text
-model_call_id   同一次 provider 响应的分组键
+model_call_id   同一次 provider 调用的 UI/观测关联值
 tool.index      provider 返回的原始 tool-call 顺序
+tool_round_id   durable assistant/result 分组身份
 ```
 
-公共 projector 在编译模型请求时，按 `model_call_id` 合并同一响应的 assistant pair，取唯一的非空 `text` 和完整 `thinking`，按 `tool.index` 恢复全部 tool calls，再按同一顺序投射 ToolResult。这样 SQLite/Blob 与 Cursor 仍保留单工具粒度，而 OpenAI Chat 端点看到的是其要求的原始 assistant 响应形状。
+公共 projector 以 durable `tool_round_id` 合并同一响应的 assistant pair，取唯一的非空 `text`、完整 `thinking` 和 provider replay state，按 `tool.index` 恢复全部 tool calls，再按真实 `completion_seq` 投射 ToolResult。`model_call_id` 只用于 UI/调用关联，不承担持久分组身份。这样 SQLite 保留真实完成顺序，而 OpenAI Chat 端点看到的是其要求的原始 assistant 响应形状。
 
 关键不变量：
 
@@ -1701,9 +1797,9 @@ ToolBatch 未完整时不发起下一轮 LLM 请求
 完成后的 provider messages 中不存在悬空 tool_calls
 ```
 
-普通模型从未返回 thinking 时，请求形状不变。OpenAI Responses 和 Anthropic 不能直接复用 `reasoning_content` 字段，应由各自 adapter 按端点原生结构处理；公共层不将 thinking 降级为普通文本。
+普通模型从未返回 replay state 时，请求形状不变。OpenAI Responses 要回传完整 reasoning output items/encrypted content，Anthropic 要回传完整 thinking blocks/signatures；两者都不能复用 `reasoning_content` 字段。公共层不将可展示 thinking 冒充任一端点的续传状态，跨 Provider 时也不解码其他端点的 capsule。
 
-旧版本已写入的 assistant tool pair 没有 `model_call_id` 和 `tool.index`，无法无歧义恢复原始 provider 响应。服务端不猜测旧分组；验证本修复应新建对话。新数据不需要额外迁移。
+当前实现不兼容旧 schema 或猜测缺失分组；初始 schema 直接保存 ToolRoundId、call index、completion sequence 和 replay state。
 
 ### 26.10 Tool 完成事件与 UI 生命周期
 
@@ -1736,7 +1832,7 @@ ToolCallCompletedUpdate
 
 - `ExecClientMessage.message = None` 不是完成结果，只表示尚无载荷；必须保持 Pending，随后等待 typed result、Shell exit、throw 或异常 stream close。
 - `PendingExecRegistry` 在下发 Exec 时保存完整 `ToolCall`、真实 `started_at_ms` 和 Shell 流缓冲；数字 ID 只在当前 Run 内用于关联。
-- Shell、Delete、Grep、Ls、ReadMcpResource、WriteShellStdin 等可直接复用上行 typed result；Read、Write、Diagnostics、MCP、Subagent、PiEdit 按 Cursor ToolCall 所需结果类型做无损或语义等价转换。
+- Shell、Delete、Grep、ReadMcpResource 等可直接复用上行 typed result；Read、Write、Diagnostics、MCP、Subagent 与编辑工具按 Cursor ToolCall 所需结果类型做无损或语义等价转换。
 - `TodoWrite` 这类服务端本地工具必须构造明确 typed success。`ExecClientThrow` 不是工具结果，直接进入统一 Error 生命周期，不伪造成某个 typed result。
 - Canonical `ToolResult` 继续用于 LLM 和持久化；不能用它替代 UI 所需的 typed protobuf result。
 - 成败不能通过完整 protobuf `Debug` 字符串搜索 `Error`、`Failure` 等单词判断。成功写入的文件内容可能恰好包含这些词，从而产生假失败。已知 oneof 必须按具体 success/error variant 判定。
@@ -1750,50 +1846,50 @@ ToolCallStarted(args, started_at_ms)
 → ExecClientMessage(id, typed result) / Shell exit
 ├→ take(id) 消费 PendingExec 的唯一所有权
 └→ 同时生成 Canonical ToolResult 与完整 typed ToolCall
-→ Blob 存储确认与单 Tool checkpoint
 → ToolCallCompleted(args + typed result + timestamps)
-→ ToolBatch 全部完整后进入下一轮 LLM
+→ 最后一个结果提交后构造 ToolRound settled Blob/Turn
+→ Blob ACK + settled checkpoint
+→ 下一轮 LLM
 ```
 
-客户端通常在 typed result 后立即发送 `stream_close`。终态 result 已经消费 PendingExec，因此 close 只是幂等尾包；不能再维护额外的 Finished/Closed 状态。`ToolCallCompleted` 必须在该工具的消息与 checkpoint 已经提交后发布。
+客户端通常在 typed result 后立即发送 `stream_close`。终态 result 已经消费 PendingExec，因此 close 只是幂等尾包；不能再维护额外的 Finished/Closed 状态。`ToolCallCompleted` 与 staged checkpoint 没有伪全局顺序；硬约束是 typed result 对应的 canonical 消息已经提交，且整个 ToolRound 的 settled checkpoint 先于下一轮模型 interaction。
 
 ### 26.11 Tool completion 的模块边界
 
-首次实现虽然修正了协议，但将 pending registry、结果通道和 typed protobuf 转换同时塞进了 `run/tool_batch.rs`、`cursor/exec.rs` 与 `cursor/interaction.rs`，使运行期关联、Exec 解析、UI 投射互相穿插。整理后的职责为：
+整理后的职责为：
 
 ```text
-cursor/pending.rs
-└─ id → ToolCall/timing/stream buffer；存在即 Running，take 即终态
+cursor/tools/runtime.rs
+└─ 当前 Cursor Run 的 wire_id → PendingExec/PendingInteraction 与完成墓碑
 
-cursor/tools.rs
-└─ 工具批次的 Cursor step index、唯一 transport 和本地立即完成工具
+cursor/tools/dispatch/
+└─ 完整 ToolCall → 唯一 Exec/Interaction/Local transport
 
-cursor/exec.rs
-└─ 解析 ExecClientMessage/ShellStream，产生 ToolCompletion
+cursor/tools/codec/{request,response}.rs
+└─ ExecServerMessage 编码与 ExecClientMessage/ShellStream 解码
 
-cursor/tool_result.rs
-├─ ToolCompletion 与结果 channel
-├─ typed Exec/Interaction result → canonical 字符串结果 + typed ToolCall
-└─ 本地 TodoWrite/CommunicateUpdate 的明确终态
+cursor/tools/result/
+└─ typed terminal result → String ToolResult + typed ToolCall
 
-cursor/interaction.rs
-└─ text/thinking/tool started/completed/usage 的事件外壳与 args 渲染
+cursor/interaction/
+└─ 模型流、InteractionQuery 和 typed ToolCall UI 渲染
 
-run/loop_engine.rs
-└─ 只决定何时持久化、checkpoint、发布 completion 和进入下一轮
+run/tool_round.rs
+└─ 只提交 canonical call/result、等待整批完成与 client state barrier
+
+cursor/checkpoint/worker.rs
+└─ 串行构造 staged/settled/final Blob 图并发布 checkpoint
 ```
 
-原 `run/tool_batch.rs` 和 `model::ToolBatch` 均已删除。Loop 已经持有有序 `ordered_calls`，只需一个 `completed call_id` 集合判断 barrier；再复制一份 calls/results 容器没有增加信息。Cursor 数字 ID、protobuf typed result 和 UI 卡片状态也不再伪装成 Loop 领域状态。
-
-`ToolCompletion` 对 Loop 是一个需要延迟发布的不透明完成信封：Loop 读取其中的 canonical `ToolResult` 完成消息和 checkpoint，Cursor adapter 读取 presentation payload 生成 UI typed result。Loop 不匹配 protobuf oneof，也不决定某种工具在 Cursor UI 中如何展示。
+`ToolCompletion` 不越过 client boundary。CursorSession 读取其中的 String ToolResult 发送通用 `ClientCommand::ToolResult`，同时保留 typed presentation，等核心回送对应 `StateCommitted` 后发布 UI completion。Loop 从未持有 protobuf oneof，也不决定某种工具在 Cursor UI 中如何展示。
 
 ### 26.12 自然状态与无 fallback 约束
 
 本轮整理删除了几类会掩盖协议错误的级联和猜测：
 
-- 工具不会再依次尝试 `Exec → Interaction → Local`。名称在 `cursor/tools.rs` 映射到唯一 transport，Loop 不持有 `ToolRoute`；未知工具立即报 Protocol error。动态 MCP 只有在本轮定义表中存在时才走 Exec。
+- 工具不会再依次尝试 `Exec → Interaction → Local`。名称在 `cursor/tools/dispatch/` 映射到唯一 transport，Loop 不持有 `ToolRoute`；未知工具立即报 Protocol error。动态 MCP 只有在本轮定义表中存在时才走 Exec。
 - Pending 项不存在 `Running/Finished/Closed` 并行标志。存在于 map 就是 Running；terminal result、throw、提前 close 都通过 `take(id)` 消费唯一所有权。
-- `ToolCompletion` 不允许只有 canonical result、没有 UI presentation 的半成品。构造成功即同时拥有可稳定投射给 LLM 的结果与完整 typed ToolCall；结构化本地结果只在 provider 边界字符串化。
+- `ToolCompletion` 不允许只有 canonical result、没有 UI presentation 的半成品。构造成功即同时拥有 String ToolResult 与完整 typed ToolCall；结构化本地结果在 Cursor result adapter 边界只字符串化一次。
 - `ToolCall.name` 与 `ExecClientMessage` oneof 必须精确匹配。Read 对上 WriteResult 等组合直接报 Protocol error，且已经消费该 terminal ID，不能继续复用。
 - 不再通过 protobuf `Debug` 文本生成 tool result 或判断成败；每个支持的 oneof 都显式读取。
 - LLM 返回的工具参数必须是合法 JSON；不再在解析失败时降级成普通字符串。
@@ -1806,7 +1902,8 @@ run/loop_engine.rs
 ```text
 tool name → 唯一 transport
 pending id → take → ToolCompletion
-ToolCompletion → persist/checkpoint → publish
+ToolCompletion → ClientCommand → durable commit → UI publish
+ToolRound settled → checkpoint barrier → next model call
 ```
 
 默认值只保留在协议本身定义为 optional 的字段上；它不能用来掩盖缺少必需字段、未知消息类型或不匹配的生命周期。
@@ -1839,7 +1936,7 @@ Cursor tool dispatcher
 - Task 返回 `agent_id` 与 `background_reason` 后，父 Tool 即完成；子代理随后通过独立 conversation/RunSSE 继续。父 Loop 不等待子 Run 结束。
 - `request_context` 和 `execute_hook` 虽然也使用 ExecServer/ClientMessage，但不是 LLM Tool，不能追加 assistant/tool pair。
 
-`AwaitShell` 不是该协议中的工具。proto 中的 `AwaitToolCall / SubagentAwaitArgs` 属于 Task/Subagent 语义，不能因为字段形状相近就把 `shell_id` 填入 `agent_id`。服务端不暴露 `AwaitShell`，也不保留该错误映射；后台 Shell 只使用实际存在的 Shell、ForceBackgroundShell 与 WriteShellStdin 消息。
+`AwaitShell` 是抓包确认的模型工具，Cursor pending contract 的 identifier 为 `AWAIT`，typed UI 使用 `AwaitToolCall`。它通过终端输出文件、等待时间和可选正则表达多阶段等待；不能把 `shell_id` 错填进 Subagent 的 `agent_id`。`ForceBackgroundShell` 与 `WriteShellStdin` 不是当前模型工具，不出现在 tool catalog，也不作为 Shell 的 fallback；后台化只由 Shell stream 的真实 `Backgrounded` 结果表达。
 
 `CommunicateUpdateSuccess.message_index` 是当前 Turn 中该 ToolCall 对应的 `ConversationStep` 一基位置，不是本地调用次数。抓包第一组事件依次产生 thinking、assistant text、CommunicateUpdate，因此结果为 `message_index = 3`；同一 Turn 后续样本累计为 `6`。服务端按已提交步骤数、当前 thinking/text 和本批 call 位置确定该值。
 
@@ -1859,25 +1956,24 @@ WebFetch 的第二阶段可以由 proto 无歧义确定：approval 后将同一�
 Cursor adapter 识别 typed terminal
 → ToolCompletion(canonical result + typed UI result)
 → Loop 统一持久化
-→ Blob ACK barrier
-→ 单 Tool checkpoint
 → ToolCallCompleted
-→ 整批完整后下一轮 LLM
+→ 整批完整后 Blob ACK + settled checkpoint barrier
+→ 下一轮 LLM
 ```
 
 具体落点：
 
-- `cursor/tools.rs` 独占工具路由和本地工具启动，并计算 Cursor step index。
-- `cursor/exec.rs` 独占 Shell 流阶段与 Exec wire event。
-- `cursor/tool_result.rs` 独占 typed result 到 `ToolCompletion` 的转换。
-- `run/loop_engine.rs` 不再包含 `ToolRoute` 或工具名称表。
+- `cursor/tools/dispatch/` 独占工具路由和本地工具启动。
+- `cursor/tools/codec/response.rs` 独占 Shell 流阶段与 Exec wire event 解码。
+- `cursor/tools/result/` 独占 typed result 到 `ToolCompletion` 的转换。
+- `run/engine.rs` 和 `run/tool_round.rs` 不包含 `ToolRoute` 或工具名称表。
 - 未知工具与不匹配 oneof 立即返回 Protocol Error；不尝试 Exec → Interaction → Local fallback。
 
 ## 27. Run 进度观测：provider_call_index 必须随 Loop 更新
 
-对运行中的 `4468e12f-4f90-4bd9-90ed-d57c9c2bc7a9` 复核后，最初看到的状态并不是卡在第一个 Ls：Ls 的 typed result、messages 和 checkpoint 都已经完成，Run 随后继续完成 Write、ReadLints、Shell 等调用，最终形成 8 轮 provider call 并正常结束。此前数据库始终显示 `provider_call_index = 0`，只是该字段从未被 Loop 更新，因而给出了错误的观测结果。
+对运行中的 `4468e12f-4f90-4bd9-90ed-d57c9c2bc7a9` 复核后，UI loading 不能仅凭数据库某一列判断 Loop 是否越过工具 barrier。该 Run 随后继续完成编辑、ReadLints、Shell 等调用，最终形成 8 轮 provider call 并正常结束。此前数据库始终显示 `provider_call_index = 0`，只是该字段从未被 Loop 更新，因而给出了错误的观测结果。
 
-`append_seqno` 只表示 BidiAppend 上行序号推进，不能回答当前正在执行第几轮 LLM。`run_tool_results` 在批次完成后会被清除，outbox ACK 也只能说明 checkpoint 已确认；它们都不能替代 provider 调用进度。
+`append_seqno` 只表示 BidiAppend 上行序号推进，不能回答当前正在执行第几轮 LLM。ToolRound 状态和 Blob SET ACK 也不能替代 provider 调用进度；协议不存在 checkpoint ACK 或持久 outbox。
 
 固定规则为：
 
@@ -1981,3 +2077,278 @@ ShellStream Backgrounded(shell_id + pid)
 - Backgrounded 终态生成成功的 canonical 字符串结果，其中包含 shell_id、pid、terminals_folder 和后台化前已收到的输出；typed ShellResult 同时保留这些字段供 Cursor UI 使用。
 - Runtime environment prompt 明确追加 terminals folder，使下一轮 LLM 可以按 Shell 工具规则读取后台日志。
 - Backgrounded 已是当前 ToolCall 的终态。后台输出不重新打开 ToolCall，也不引入不存在的 AwaitShell。
+- `Backgrounded` 只结束当前 ToolCall，不结束客户端持有的后台进程；成功 `TurnEnded/EndStream` 不发送 `ExecServerAbort`。失败或取消也只 abort 尚未返回终态的 Exec，不能回收已经后台化的 Shell。
+- 后台化只有一层：长驻命令本身保持前台形式，例如 `python3 -m http.server 9000`，并以 `block_until_ms=0` 交给 Cursor 管理。不能同时使用 `nohup`、`&` 或 `disown`；否则 Cursor 管理的是很快退出的外层 shell，真实子进程不再具有后台 Shell 生命周期。
+
+本地异常样本 `run_id=2aacf882-3b6b-4b66-9c08-5342ee5cd6b6` 正是双重后台化：Shell 参数已经是 `block_until_ms=0`，command 又执行 `nohup python3 -m http.server 9000 ... &`。Run 正常 completed，服务端没有 abort；终端 `121702` 记录外层命令成功结束，而真正 server 子进程随后消失。因此修复位于 Shell 模型契约，codec 保持官方 ShellArgs，不对用户命令做字符串改写。
+
+## 30. Write / StrReplace 的参数流、展示流与执行边界
+
+provider 的 `ToolCallArgumentsDelta` 是原始 JSON 文本增量，Cursor 的 `EditToolCallDelta.stream_content_delta` 是编辑卡片消费的语义内容增量。两者不是同一种事件。
+
+最新官方抓包中的两个编辑分别写入 10414 字符和修改 6 字符。两者在 Cursor UI 层都表现为 `EditToolCall`，Exec 层都实际执行 `ReadArgs → ReadResult → WriteArgs → WriteResult`，没有出现 `PiEditArgs`。第一次使用数字 id 46/47，第二次使用缺省 id 0/1；每组 Read 和 Write 都复用同一个原始 `tool_call_id`。
+
+固定事件映射为：
+
+```text
+LLM ToolCallStart
+→ PartialToolCallUpdate(call_id/name, 空 Edit 占位)
+
+LLM ToolCallArgumentsDelta(raw JSON)
+→ 增量 JSON 字符串解码
+→ Write.contents / StrReplace.new_string 的已解码字符
+   立即发布 ToolCallDelta(EditToolCallDelta.stream_content_delta)
+→ path 完整后发布 PartialToolCall(EditArgs.path)
+
+LLM 参数完整
+→ 对完整 arguments_text 做一次严格 JSON 解析
+→ ToolCallStarted(EditArgs.path + 已累计的完整 stream_content)
+→ 隐藏 ReadArgs(path, 同一个 tool_call_id)
+
+BidiAppend ReadResult
+→ Write：得到 before；file_not_found 表示 before 为空
+→ StrReplace：在 before 上执行规范化后的精确 old_string/new_string 替换
+→ 隐藏 WriteArgs(path, 完整 after, 同一个 tool_call_id)
+
+BidiAppend WriteResult
+→ 用 before/after 构造 diff、lines_added、lines_removed 和 EditResult
+→ 持久化完整 assistant/tool pair
+→ ToolCallCompleted
+→ 若为本轮最后结果：Blob ACK 与 ToolRound settled checkpoint
+```
+
+`EditToolCallDelta` 不依赖 path，也不依赖 `ToolCallStarted`。官方抓包明确出现“完整内容 delta → path partial → started”的顺序，因此服务端不能把内容缓存到 path 到达之后。`ToolCallStarted` 是参数已经完整、即将执行的边界，不是编辑增量的前置条件。
+
+Read 和 Write 是两个独立 Exec 请求，各有自己的数字 `id`，由 `PendingExecRegistry` 分别匹配 BidiAppend 返回；它们共享同一个 `tool_call_id`，因为对 UI 和 LLM 来说仍是同一个工具。客户端只执行普通 Read/Write，不知道服务端内部的两阶段状态。
+
+编辑域的文本统一使用 LF：JSON 的 `\\n` 先解码为真实换行，再将 CRLF 和单独 CR 规范化为 LF。Read 内容、Write 完整内容、StrReplace 的 old/new、UI stream delta、精确匹配、diff 和 `WriteArgs.file_text` 使用同一规范文本。流式规范化必须保留 chunk 末尾未决的 CR，等下一 chunk 判断它是否与 LF 组成 CRLF，不能重复发布换行。
+
+抓包中的 `tool_call_id` 含真实内部换行，例如 `call-...\nfc_..._0`。它是 Cursor wire 的不透明标识，不得拆分、重建或清理内部换行；Partial、Delta、Started、隐藏 Read、隐藏 Write、Completed 必须逐字复用。Provider 的 call id/item id 应作为独立元数据保存，不能靠反向解析这个组合值恢复。
+
+实现保持 Loop 工具无关：`run/model_cycle.rs` 只消费统一 provider 事件，`cursor/tools/stream.rs` 只做实时 UI 投射，`cursor/tools/edit.rs` 负责 LF 规范化、替换计算和 diff，`cursor/tools/codec/response.rs` 负责隐藏 Read/Write 状态推进，`cursor/tools/runtime.rs` 保存当前阶段。没有 post-read、Windows path 猜测、内容不一致自动修复或旧编辑消息兼容路径。
+
+messages、Blob 和 checkpoint 只保存最终完整 ToolCall 与 ToolResult。`PartialToolCall` 和 `EditToolCallDelta` 都是可丢弃的实时 UI 投影，不进入上下文事实源，也不影响下一轮 LLM 的前缀稳定性。
+
+## 31. 本地 Agent 路由与 Cursor backend 转发边界
+
+`--test-backend-url` 或等价 endpoint 配置会把大量 Cursor backend 请求送入本地服务，不只有 Agent loop。官方抓包中的这些请求具有统一上游 `https://api2.cursor.sh`。因此 Rust 服务不能把尚未实现的接口当作本地 404；否则模型列表、服务配置、对话 metadata、认证及其他旁路业务都会被误判为不存在。
+
+固定路由顺序为：
+
+```text
+incoming request
+├─ POST /agent.v1.AgentService/RunSSE
+│  └─ 本地 RunSSE handler
+├─ POST /aiserver.v1.BidiService/BidiAppend
+│  └─ 本地 BidiAppend handler
+└─ 其他 method/path
+   └─ https://api2.cursor.sh + 原 path/query
+```
+
+转发保持 method、path/query、端到端 headers 和 body；响应保持上游 status、端到端 headers 和 body。请求和响应都使用流，不先聚合完整正文，因此 Connect/SSE 和大请求不会被代理层阻塞。目标 `Host`/authority 必须改为上游，`Connection`、`Transfer-Encoding`、`Upgrade` 等 hop-by-hop headers 不能跨连接复制。
+
+本地 `RequestDecompressionLayer` 只作用于两个被接管的 protobuf 路由。代理请求不经过本地解压，避免 body 已改变而 `Content-Encoding` 仍沿用原值。只有无法建立上游连接时才由本地返回 `502 unavailable`；上游实际返回的 4xx/5xx 不改写。
+
+每次代理在收到上游响应头后记录 method、path、status 和耗时；连接失败记录 error。由此客户端出现 404 时可以明确区分：它是上游真实 404，而不是 Rust Router 漏注册产生的默认 404。
+
+## 32. 子代理的写入、MCP 能力与工具集合
+
+主对话 `conversation_id = c7e5502c-8953-4a73-b5bb-226dd9c0b8f3` 中，`request_id = 37fca97d-4f8a-487e-a465-bf6975654ffb` 的用户指令为：
+
+```text
+接下来发起三个子代理，测试他们的文件写入和mcp能力
+其中2个是后台的，一个是前台的
+```
+
+该轮实际创建了三个独立子对话：两个 `run_in_background = true`，一个 `run_in_background = false`。子代理能够执行文件写入和 MCP 操作，因此子代理不是只读搜索器，也不是只能返回文本的缩减 Loop。
+
+抓包 checkpoint 中的 `pendingToolExecutionContracts.allowedToolNames` 确认，子代理当前工具集合为：
+
+```text
+Shell
+Grep
+Delete
+WebSearch
+WebFetch
+GenerateImage
+ReadLints
+EditNotebook
+TodoWrite
+StrReplace
+Write
+Read
+Glob
+Task
+AwaitShell
+GetMcpTools
+FetchMcpResource
+SwitchMode
+UpdateCurrentStep
+CallMcpTool
+```
+
+关键结论：
+
+- 子代理明确包含 `Write`、`StrReplace`、`EditNotebook` 和 `Delete`，具备写文件及修改工作区的能力。
+- 子代理明确包含 `GetMcpTools`、`CallMcpTool` 和 `FetchMcpResource`，具备 MCP 发现、调用和资源读取能力。
+- `run_in_background` 只决定父 Run 是否等待子代理完成，不改变子代理的 tools、messages、Blob/checkpoint 或 LLM Loop 语义。前台和后台子代理都是完整的独立 Run。
+- 子代理工具集不含 `AskQuestion`，而是用 `UpdateCurrentStep` 向父 Task 的时间线报告进度和最终摘要。
+- `Task` 仍在子代理工具集中；是否允许再创建子代理由子 Run 末尾的 runtime/system reminder 和服务端策略约束，不应靠删除 wire tool 来猜测。
+
+因此，服务端不应为“前台子代理”、“后台子代理”或“MCP 子代理”建立不同 Loop。它们共享同一个 `RunActor + ToolDispatcher`；差异只来自子 `RunRequest` 的代理类型、模型配置、runtime reminder 和父子关系字段。
+
+## 33. Agent 工具资产与子代理自然派生
+
+工具资产现在只有一个完整 schema 事实源：`prompt/cursor/tools.json`。不存在 `tools-full.json`，也不存在 Agent/Subagent 各自复制的完整 schema。`prompt/cursor/modes/*.json` 只按抓包保存有序名称；需要不同参数形状的 `Task.subagent` 是同一 catalog 中的显式 variant，`UpdateCurrentStep` 也在 catalog 中定义一次。
+
+模型请求编译时按抓包关系形成最终工具集：
+
+```text
+主 Agent = tools.json catalog
+          × modes/agent.json 的有序选择
+
+子 Agent = tools.json catalog
+          × modes/subagent.json 的有序选择
+          - AskQuestion
+          + Task.subagent（无 environment/cloud_base_branch）
+          + UpdateCurrentStep
+```
+
+`suppress_subagent_progress_update_tool = true` 时再移除 `UpdateCurrentStep`。这不是 fallback 或兼容分支，而是 RunRequest 中有明确 wire 字段控制的能力。子代理仍保留 `Task`，但没有 Cloud 参数；`PatchEdit` 不再存在，统一使用当前协议中的 `StrReplace`。
+
+抓包中主代理和子代理的基础 system prompt 使用相同 Blob hash。子代理身份、父任务和运行期要求由追加的 user/runtime 信息表达，因此子代理编译也使用 Agent prompt，不使用另一份容易漂移的缩减 system prompt。这同时保持 messages 的只追加语义和前缀稳定性。
+
+### 33.1 Task 与子代理模型
+
+`Task` 的自然链路为：
+
+```text
+LLM Task arguments
+→ TaskToolCall.args（UI）
+→ ExecServerMessage.subagent_args（客户端执行）
+→ 独立子 RunRequest
+```
+
+`generalPurpose` 在 `TaskArgs.subagent_type` 中编码为 `unspecified`，但在 `SubagentArgs.subagent_type` 中发送字符串 `generalPurpose`；`cursor-guide` 使用明确的 `cursor_guide` oneof，其余具有协议 oneof 的类型同理，自定义类型保留原始名称，不能先转小写再回写。
+
+`SubagentArgs.parent_conversation_id` 使用当前 conversation；`root_parent_conversation_id` 使用 `conversation_group_id`，根对话没有 group 时才等于当前 conversation。`accept_hook_additional_contexts = false`，与抓包一致。模型在父 Run 内一次解析：`subagent_model_overrides` 的显式 model 优先，inherit 解析为父模型，disabled 直接拒绝该类型；没有 override 时，`Task.model = inherit` 或缺省同样解析为父模型，显式 model 则原样使用。确定的 `model_id` 才进入 SubagentArgs，子 RunRequest 再通过 `requested_model` 把模型和参数传给独立 Run。父子模型不同不改变 messages 或前缀缓存规则。
+
+### 33.2 UpdateCurrentStep 与 checkpoint
+
+模型工具名是 `UpdateCurrentStep`，Cursor protobuf 的表现类型仍叫 `CommunicateUpdateToolCall`。服务端必须保持这两个命名层次，不能向模型暴露旧名 `CommunicateUpdate`。
+
+该工具本地立即完成，成功结果写入 canonical messages：
+
+```text
+arguments.current_step / final_summary / completed_subtitle
+→ CommunicateUpdateToolCall
+→ success(current_step, message_index)
+→ canonical ToolResult
+```
+
+子 BidiAppend 的 `X-Parent-Agent-Tool-Call-Id` 被绑定到 `RunHandle`，同一 Run 若收到冲突值直接报协议错误。checkpoint 不维护第二套可变进度状态，而是从已持久化的 assistant ToolCall 和对应 ToolResult fold 出 `CommunicateUpdateTurnState`，写入：
+
+```text
+communicate_update_states_by_parent_tool_call_id[parent Task call_id]
+```
+
+其中 `history[]` 保存每次 `current_step + message_index`，最后一次带值的调用提供 `final_summary` 和 `completed_subtitle`。因此恢复、重放和 checkpoint 都由 messages 唯一决定。
+
+### 33.3 GetMcpTools 使用客户端实时状态
+
+旧实现直接读取初始 RunRequest 的 MCP descriptor 快照并在服务端本地完成，这是错误的：它绕过了客户端当前连接状态。抓包确认的链路为：
+
+```text
+GetMcpTools started
+→ ExecServerMessage.mcp_state_exec_args
+→ BidiAppend McpStateExecResult(success.servers / error / rejected)
+→ 按 server、toolName、pattern 过滤
+→ GetMcpTools completed
+```
+
+现在 `GetMcpTools` 与其他客户端 Exec 一样先在 `PendingExecRegistry` 以数字 id 登记，再等待该 id 的 Bidi 结果。`McpStateExecArgs.server_identifiers` 只在请求指定 server 时填写，`kick_only = false`、`accept_hook_additional_contexts = false`。成功、错误和拒绝都生成相应 typed tool result，并以字符串内容追加到下一轮 LLM messages；不再从数据库或旧 descriptor 旁路完成。
+
+请求 `790aff97-8c6a-4717-b9db-ccdae211c67c` 暴露了调用阶段的第二个协议要求：`GetMcpTools` 能正常列出 `server=plugin-browser-use-browser-use, toolName=browser_exec`，但旧服务端随后把 `McpArgs.name` 也写成 `browser_exec`、把 `provider_identifier` 写成空字符串，因此 Cursor 三次都返回 `MCP tool not found: browser_exec`。
+
+官方抓包的 `McpStateExecResult` 已经给出完整定义，例如：
+
+```text
+server_identifier   = plugin-browser-use-browser-use
+definition.name     = plugin-browser-use-browser-use-browser_exec
+provider_identifier = browser-use
+tool_name           = browser_exec
+```
+
+后续官方 `McpArgs` 原样使用这四个值。因此 Run 内的 MCP 定义表必须由成功的 `McpStateExecResult` 更新，以 `(server_identifier, tool_name)` 为键；`CallMcpTool` 只从这张客户端实时表取回完整 `McpToolDefinition` 并填写 Exec。不能从 server 名称截取 provider，也不能自行拼接 definition name；当精确定义不存在时，应明确要求先执行 `GetMcpTools`，不发送字段不完整的 MCP Exec。这个定义表属于 `CursorToolRuntime`，在 Run 结束时与其他 Exec 态一起释放，不读写 SQLite。
+
+官方 conversation `c62e79ea-1bb2-4190-adae-cadf584d9976`（request `b0562e27-4b0e-4373-afd9-e19c74b2838e`）还给出了完整成功闭环：RunSSE frame 45/49 分别要求 `user-context7` 和 `user-codegraph` 的 MCP state；frame 157 以 `id=8` 发送 Context7 `McpArgs`，frame 184 以 `id=9` 发送 Codegraph `McpArgs`。Bidi exchange 11084 以同一 `id=8` 返回真实文本内容，exchange 11095 以 `id=9` 返回 `No results found for "main"`，两者均为 `McpResult.success`。因此 MCP 成功结果不能被压缩成 `mcp success content=N` 这类调试摘要；必须把 text、output location 和 structured content 编译成 canonical 字符串 ToolResult，`is_error` 原样保留，再进入下一轮 LLM。
+
+### 33.4 证据边界
+
+当前抓包已经给出 Shell、Read/Write/Edit、Delete、Glob/Grep、WebFetch、Task、AwaitShell、MCP、SwitchMode、UpdateCurrentStep 等 wire 生命周期。`WebSearch` 抓包还证明客户端只返回 approval，搜索结果由官方服务端产生；`GenerateImage` 同样属于服务端外部执行能力。它们不能伪装成本地成功，也不能仅凭 proto 编造执行器：在接入明确的搜索/图像 provider 前，现有代码只实现其 Cursor approval wire，批准后仍必须显式报未配置的服务端能力，而不是产生虚假 ToolResult。
+
+### 33.5 子代理/队列恢复中的 Run 身份
+
+本地异常样本显示，`001e763b-fcd4-4945-969f-57721dd827d2` 是根 Run；它派生了四个独立子 Run：`dd0971a8…`（explore）、`5ddee013…`（generalPurpose）、`2412aab8…`（shell）和 `dea4c0f5…`（cursor-guide）。`cursor-guide` 失败回传期间，Cursor 以新的 RunSSE/Bidi `request_id=2bfd06f0…` 发起一次尝试，但 `AgentRunRequest.run_id` 复用了根值 `001e763b…`。因此该 wire 字段不能作为 `runs.run_id` 的执行唯一键。
+
+Cursor adapter 现在使用每次 RunSSE/Bidi 的 `request_id` 创建通用内部 RunId；wire `run_id` 不越过 adapter 成为 Store 主键。这样队列恢复是新执行，可以按客户端带回的 revision 取得 conversation ownership 并取消旧执行，而不会撞旧行。
+
+此外，Run claim 失败发生在新执行尚未拥有数据库状态之前。该失败只能向当前客户端返回 typed Error，绝不能调用 `finish_run` 修改同 ID 的既有记录。旧实现正是违反了这一点：重复 INSERT 失败后又把仍在工作的根 `001e…` 标成 failed。现在只有 claim 成功的 Run 才有资格持久化 Completed/Cancelled/Failed 终态。
+
+### 33.6 后台子代理完成通知
+
+Task 首次创建子代理时，客户端 `SubagentSuccess` 已返回 `agent_id`，Task 调用参数中的 `description` 是该子代理的用户可见 name。两者必须立即进入 canonical ToolResult 字符串：
+
+```text
+Subagent name: {description}
+Subagent ID: {agent_id}
+```
+
+这条 ToolResult 表达“Task 创建出了哪个对象”，即使后台 Task 此时没有 `final_message` 也不能返回空字符串；否则 Cursor typed UI 虽持有 `TaskSuccess.agent_id`，下一轮 LLM 却不知道刚创建的子代理身份，只能从 transcript 文件或后续 completion 猜测。若首次创建时已经有 `final_message`，它接在身份之后。`resume={已有 agent_id}` 不是创建，不重复包装身份，仍只返回本次执行结果；`resume=self` 会创建新子代理，因此使用新返回的 name 和 ID。
+
+官方抓包确认，后台子代理结束后客户端会为父 conversation 发起新的 RunSSE/Bidi。该 `AgentRunRequest.action` 不是普通 `user_message_action`，而是 `background_task_completion_action`；每个 completion 明确携带 `task_id`、`subagent_id`、父 `tool_call_id`、`title`、`status`、`reason`、`detail` 和 transcript `output_path`。服务端不应自行轮询子 Run，也不应从 Task 文本猜测哪个子代理完成。
+
+当 `kind = SUBAGENT` 且 `reason = TASK_FINISHED` 时，completion 的 detail 先成为本轮模型可见的完成上下文，随后以 user/runtime 身份追加官方完整版 follow-up：
+
+```text
+Perform any necessary follow-up actions in response to the subagent completion above. If no follow-up work is needed, no further action is required. If you mention an agent or subagent in your response, link it with the `[Name](id)` Don't use generic label such as `[agent]`, `[worker]`, or `[subagent]`. For cloud subagents, when the agent has edited code, link to `[Review](bc-id#changes)`, or, if you know the exact added and deleted line counts, `[Review +A −D](bc-id#changes)`, replacing A and D with those counts. Never write A or D literally. Use `[Try Live](bc-id#desktop)` only when the agent used computer use. Don't repeat the same confirmation every time.
+```
+
+抓包中四个后台子代理依次完成时，客户端发起了四个 completion Run，以上完整提醒也出现四次。它不是 conversation 级一次性提示，而是每个完成事件各追加一次；幂等键为 `subagent-completed:{subagent_id}`。同一 completion 重试不会产生第二条 message，不同子代理完成则保持原始时间顺序继续追加。
+
+```text
+后台 Task 启动，父 Turn 结束
+→ 子代理完成
+→ 客户端发送 background_task_completion_action
+→ 服务端验证 SUBAGENT + TASK_FINISHED + subagent_id
+→ 持久化完成 detail 与完整 follow-up user/runtime message
+→ checkpoint 确认
+→ 父 conversation 新一轮 LLM
+```
+
+该事件同时生成 `is_simulated_msg = true`、`simulated_msg_reason = BACKGROUND_TASK_COMPLETION` 的 Cursor UserMessage/Turn，因此 UI、Blob 图和模型上下文表达同一事实。服务端此前虽然能读取普通 UserMessage 的 `subagent_system_reminder`，却完全忽略 `background_task_completion_action`；这正是后台子代理完成后父代理不会自然汇报的原因。
+
+runtime message 的 checkpoint wire ID 是稳定身份 `runtime:{event_id}`，恢复时必须原样保留。`cursor-root:{blob_id}:{ordinal}` 只用于 wire ID 会重复、仅表达投射位置的普通 Cursor message，例如 assistant 的 `id = "1"`；不能替换 runtime 身份。请求 `9c1b5252-38a9-4829-87f5-2d2dda3ea37c` 的失败正是因为恢复代码把已有 `runtime:subagent-completed:{subagent_id}` 改成了位置 ID：数据库按相同 `runtime_event_id` 找到旧事件，却发现完整 canonical message 的 `message_id` 已改变，于是正确拒绝“同一事件、不同内容”。修复应恢复稳定身份，不能放宽唯一约束、覆盖旧消息或吞掉冲突。
+
+### 33.7 编辑历史消息与活动后缀截断
+
+`UserMessageAction` 没有 `edited` 标志；协议提供的稳定逻辑身份是 `UserMessage.message_id`。Cursor 在用户修改历史消息后会复用这个 ID 并发送新的内容。它不能继续直接充当不可变 canonical message 的主键，否则同 ID、不同 payload 会触发 `message id or runtime event reused with different content`。
+
+服务端把客户端逻辑输入身份记为 `cursor:user:{message_id}`，并在第一次看到它时绑定“该输入追加前”的 `base_revision_id`：
+
+```text
+第一次发送 M
+input anchor(M) = revision before M
+→ append immutable runtime message for this Run
+→ append assistant/tool suffix
+
+编辑并再次发送 M
+→ resolve input anchor(M)
+→ conversation active head 回到 revision before M
+→ append a new immutable runtime message
+→ 生成新的 assistant/tool suffix
+```
+
+因此活动上下文的实际结果就是“编辑点之前的前缀 + 修改后的用户消息 + 新后缀”。原用户消息以及它后面的 assistant/tool 消息不会进入新的 LLM 请求，也不会出现在新 checkpoint 的活动 Turn 图中。旧 revision 和不可变 Blob 不做覆盖或物理删除，仍可用于历史回滚；这里所谓删除是从当前 revision 的可达集合中删除。
+
+输入 anchor 使用 `(conversation_id, input_id)` 唯一键并持久化，不能只放在 Run 内存中：编辑可能发生在进程重启后。重复请求通过同一个 anchor 得到同一 base；不同内容则形成新的不可变分支。Run claim 已具备把 conversation head 原子切到所选 base 的能力，后续 append 仍受 active Run ownership 保护。

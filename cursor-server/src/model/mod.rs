@@ -1,11 +1,23 @@
 mod conversation;
+mod inference;
+mod llm_call;
 mod message;
+mod model_spec;
+mod projection;
+mod provider;
+mod run;
 mod runtime_tag;
 mod tool;
 mod usage;
 
 pub use conversation::*;
+pub use inference::*;
+pub use llm_call::*;
 pub use message::*;
+pub use model_spec::*;
+pub use projection::*;
+pub use provider::*;
+pub use run::*;
 pub use runtime_tag::*;
 pub use tool::*;
 pub use usage::*;

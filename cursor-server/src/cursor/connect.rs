@@ -94,7 +94,7 @@ fn encode_end_stream_payload(payload: &[u8]) -> Bytes {
 pub fn decode_unary<M: Message + Default>(body: &[u8]) -> Result<M> {
     if body.len() >= 5 {
         let flags = body[0];
-        let length = u32::from_be_bytes(body[1..5].try_into().expect("four bytes")) as usize;
+        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
         if flags & END_STREAM_FLAG == 0 && length == body.len() - 5 {
             return Ok(M::decode(&body[5..])?);
         }
@@ -109,7 +109,7 @@ pub fn decode_frames(mut body: &[u8]) -> Result<Vec<(u8, Bytes)>> {
             return Err(Error::Protocol("truncated Connect envelope".into()));
         }
         let flags = body[0];
-        let length = u32::from_be_bytes(body[1..5].try_into().expect("four bytes")) as usize;
+        let length = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
         body = &body[5..];
         if body.len() < length {
             return Err(Error::Protocol("truncated Connect payload".into()));

@@ -1,10 +1,17 @@
+use std::{future::IntoFuture, time::Duration};
+
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
-    cursor::handlers,
-    prompting::{PromptAssets, PromptCompiler},
-    provider::build_provider,
+    control,
+    cursor::{
+        handlers,
+        prompting::{PromptAssets, PromptCompiler},
+        CursorSessionRegistry,
+    },
+    provider::ProviderRouter,
     run::RunRegistry,
     store::Store,
     Result,
@@ -13,7 +20,7 @@ use crate::{
 pub struct App {
     config: Config,
     router: axum::Router,
-    registry: RunRegistry,
+    registry: CursorSessionRegistry,
 }
 
 impl App {
@@ -21,10 +28,15 @@ impl App {
         let store = Store::connect(&config.database_url).await?;
         let assets = PromptAssets::embedded()?;
         let compiler = PromptCompiler::new(assets);
-        let provider = build_provider(&config.provider)?;
-        let registry = RunRegistry::new(store, provider, compiler, config.provider.model.clone());
+        let provider = std::sync::Arc::new(ProviderRouter::new(
+            store.clone(),
+            config.provider_request_timeout,
+        ));
+        let run_registry = RunRegistry::default();
+        let registry = CursorSessionRegistry::new(store.clone(), provider, compiler, run_registry);
+        let router = handlers::router(registry.clone())?.merge(control::router(store));
         Ok(Self {
-            router: handlers::router(registry.clone()),
+            router,
             registry,
             config,
         })
@@ -34,14 +46,31 @@ impl App {
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         tracing::info!(address = %self.config.listen_addr, "cursor server listening");
         let registry = self.registry;
-        axum::serve(listener, self.router)
-            .with_graceful_shutdown(shutdown_signal(registry))
-            .await?;
+        let shutdown = CancellationToken::new();
+        let graceful = shutdown.clone();
+        let server = axum::serve(listener, self.router)
+            .with_graceful_shutdown(async move {
+                graceful.cancelled().await;
+            })
+            .into_future();
+        tokio::pin!(server);
+
+        let signal = shutdown_signal(registry, shutdown);
+        tokio::pin!(signal);
+        tokio::select! {
+            result = &mut server => result?,
+            () = &mut signal => {
+                match tokio::time::timeout(Duration::from_secs(10), &mut server).await {
+                    Ok(result) => result?,
+                    Err(_) => tracing::warn!("graceful shutdown timed out; forcing server close"),
+                }
+            }
+        }
         Ok(())
     }
 }
 
-async fn shutdown_signal(registry: RunRegistry) {
+async fn shutdown_signal(registry: CursorSessionRegistry, shutdown: CancellationToken) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -57,5 +86,6 @@ async fn shutdown_signal(registry: RunRegistry) {
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
     tracing::info!("shutdown signal received; cancelling active runs");
+    shutdown.cancel();
     registry.shutdown().await;
 }

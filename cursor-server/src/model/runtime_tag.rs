@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{CanonicalMessage, MessageContent, Origin, Role};
+use super::{CanonicalMessage, ContentPart, MessageContent, Origin, Role};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeEvent {
@@ -14,7 +14,9 @@ impl RuntimeEvent {
             message_id: format!("runtime:{}", self.event_id),
             role: Role::User,
             origin: Origin::Runtime,
-            content: MessageContent::Text { text: self.text },
+            content: MessageContent::Parts {
+                parts: vec![ContentPart::Text { text: self.text }],
+            },
             runtime_event_id: Some(self.event_id),
         }
     }

@@ -1,29 +1,60 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use super::Usage;
+macro_rules! string_id {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Self {
+                Self(value.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(formatter)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(value: String) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(value: &str) -> Self {
+                Self(value.into())
+            }
+        }
+    };
+}
+
+string_id!(ConversationId);
+string_id!(RunId);
+string_id!(ToolRoundId);
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct RevisionId(pub i64);
+
+impl fmt::Display for RevisionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Conversation {
-    pub conversation_id: String,
-    pub revision: i64,
-    pub head_blob_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStatus {
-    Running,
-    Completed,
-    Interrupted,
-    Failed,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Turn {
-    pub request_id: String,
-    pub run_id: String,
-    pub conversation_id: String,
-    pub revision: i64,
-    pub status: TurnStatus,
-    pub usage: Usage,
+    pub conversation_id: ConversationId,
+    pub current_revision_id: RevisionId,
+    pub active_run_id: Option<RunId>,
 }

@@ -6,14 +6,14 @@ use std::{
 };
 
 use cursor_server::{
-    prompting::ModelRequest,
-    provider::{Provider, ProviderStream, ResponseEvent},
+    model::{ModelInvocation, ModelRequest},
+    provider::{ModelEvent, Provider, ProviderStream},
     Error,
 };
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
 
-type FakeResponse = Vec<Result<ResponseEvent, Error>>;
+type FakeResponse = Vec<Result<ModelEvent, Error>>;
 
 #[derive(Clone, Default)]
 pub struct FakeProvider {
@@ -22,7 +22,7 @@ pub struct FakeProvider {
 }
 
 impl FakeProvider {
-    pub fn push(&self, events: Vec<ResponseEvent>) {
+    pub fn push(&self, events: Vec<ModelEvent>) {
         self.responses
             .lock()
             .unwrap()
@@ -37,8 +37,12 @@ impl FakeProvider {
 }
 
 impl Provider for FakeProvider {
-    fn stream(&self, request: ModelRequest, _cancellation: CancellationToken) -> ProviderStream {
-        self.requests.lock().unwrap().push(request);
+    fn stream(
+        &self,
+        invocation: ModelInvocation,
+        _cancellation: CancellationToken,
+    ) -> ProviderStream {
+        self.requests.lock().unwrap().push(invocation.request);
         let events = self
             .responses
             .lock()

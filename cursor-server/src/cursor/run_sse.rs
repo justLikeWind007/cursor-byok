@@ -6,9 +6,9 @@ use bytes::Bytes;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::{run::RunRegistry, Result};
+use crate::{cursor::CursorSessionRegistry, Result};
 
-pub async fn stream(registry: &RunRegistry, request_id: &str) -> Result<Response<Body>> {
+pub async fn stream(registry: &CursorSessionRegistry, request_id: &str) -> Result<Response<Body>> {
     let receiver = registry.get_or_create(request_id).await?.subscribe();
     let body_stream =
         UnboundedReceiverStream::new(receiver).map(Ok::<Bytes, std::convert::Infallible>);

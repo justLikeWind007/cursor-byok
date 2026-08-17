@@ -1,162 +1,200 @@
 use sqlx::Row;
 
 use crate::{
-    model::{ToolResult, Usage},
-    Result,
+    model::{ConversationId, PreparedRun, RevisionId, RunId, RunKind, Usage},
+    Error, Result,
 };
 
 use super::{now_ms, Store};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunStatus {
-    Waiting,
     Running,
     Completed,
-    Interrupted,
+    Cancelled,
     Failed,
 }
 
 impl RunStatus {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Waiting => "waiting",
             Self::Running => "running",
             Self::Completed => "completed",
-            Self::Interrupted => "interrupted",
+            Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimedRun {
+    pub run_id: RunId,
+    pub conversation_id: ConversationId,
+    pub head_revision_id: RevisionId,
+    pub replaced_run_id: Option<RunId>,
+}
+
 impl Store {
-    pub async fn create_pending_run(&self, request_id: &str) -> Result<()> {
+    pub async fn claim_run(&self, prepared: &PreparedRun) -> Result<ClaimedRun> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        Self::ensure_conversation_tx(&mut tx, &prepared.conversation_id).await?;
+        let belongs: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM conversation_revisions
+                WHERE revision_id = ? AND conversation_id = ?
+             )",
+        )
+        .bind(prepared.base_revision_id.0)
+        .bind(prepared.conversation_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !belongs {
+            return Err(Error::Store(format!(
+                "base revision {} does not belong to conversation {}",
+                prepared.base_revision_id, prepared.conversation_id
+            )));
+        }
+
+        let replaced: Option<String> =
+            sqlx::query_scalar("SELECT active_run_id FROM conversations WHERE conversation_id = ?")
+                .bind(prepared.conversation_id.as_str())
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(replaced) = replaced.as_deref() {
+            if replaced != prepared.run_id.as_str() {
+                sqlx::query(
+                    "UPDATE runs SET status = 'cancelled', updated_at_ms = ?
+                     WHERE run_id = ? AND status = 'running'",
+                )
+                .bind(now_ms())
+                .bind(replaced)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let (parent_run_id, parent_tool_call_id, run_kind, subagent_kind) =
+            run_kind_columns(&prepared.kind);
         let now = now_ms();
         sqlx::query(
-            "INSERT OR IGNORE INTO runs(request_id, status, created_at_ms, updated_at_ms) VALUES (?, 'waiting', ?, ?)",
+            "INSERT INTO runs
+             (run_id, conversation_id, base_revision_id, head_revision_id,
+              parent_run_id, parent_tool_call_id, run_kind, subagent_kind,
+              status, created_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)",
         )
-        .bind(request_id).bind(now).bind(now)
-        .execute(&self.pool).await?;
-        Ok(())
-    }
+        .bind(prepared.run_id.as_str())
+        .bind(prepared.conversation_id.as_str())
+        .bind(prepared.base_revision_id.0)
+        .bind(prepared.base_revision_id.0)
+        .bind(parent_run_id)
+        .bind(parent_tool_call_id)
+        .bind(run_kind)
+        .bind(subagent_kind)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
 
-    pub async fn next_append_seqno(&self, request_id: &str) -> Result<i64> {
-        let current: i64 = sqlx::query_scalar("SELECT append_seqno FROM runs WHERE request_id = ?")
-            .bind(request_id)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(current + 1)
-    }
-
-    pub async fn bind_run(
-        &self,
-        request_id: &str,
-        run_id: &str,
-        conversation_id: &str,
-        revision: i64,
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
         sqlx::query(
-            "UPDATE runs SET run_id = ?, conversation_id = ?, revision = ?, status = 'running', updated_at_ms = ? WHERE request_id = ?",
+            "UPDATE conversations
+             SET current_revision_id = ?, active_run_id = ?, updated_at_ms = ?
+             WHERE conversation_id = ?",
         )
-        .bind(run_id).bind(conversation_id).bind(revision).bind(now_ms()).bind(request_id)
-        .execute(&mut *tx).await?;
+        .bind(prepared.base_revision_id.0)
+        .bind(prepared.run_id.as_str())
+        .bind(now)
+        .bind(prepared.conversation_id.as_str())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(ClaimedRun {
+            run_id: prepared.run_id.clone(),
+            conversation_id: prepared.conversation_id.clone(),
+            head_revision_id: prepared.base_revision_id,
+            replaced_run_id: replaced
+                .filter(|run| run != prepared.run_id.as_str())
+                .map(RunId),
+        })
     }
 
-    pub async fn advance_append_seqno(&self, request_id: &str, seqno: i64) -> Result<bool> {
-        let changed = sqlx::query(
-            "UPDATE runs SET append_seqno = ?, updated_at_ms = ? WHERE request_id = ? AND append_seqno < ?",
+    pub async fn begin_provider_call(&self, run_id: &RunId) -> Result<u64> {
+        let index: Option<i64> = sqlx::query_scalar(
+            "UPDATE runs SET provider_call_index = provider_call_index + 1, updated_at_ms = ?
+             WHERE run_id = ? AND status = 'running'
+             RETURNING provider_call_index",
         )
-        .bind(seqno).bind(now_ms()).bind(request_id).bind(seqno)
-        .execute(&self.pool).await?.rows_affected() == 1;
-        Ok(changed)
+        .bind(now_ms())
+        .bind(run_id.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        index
+            .map(|index| index as u64)
+            .ok_or_else(|| Error::Store(format!("run is not active: {run_id}")))
     }
 
-    pub async fn update_run_status(
+    pub async fn finish_run(
         &self,
-        request_id: &str,
+        run_id: &RunId,
         status: RunStatus,
-        usage: Usage,
-    ) -> Result<()> {
-        sqlx::query("UPDATE runs SET status = ?, turn_usage_json = ?, updated_at_ms = ? WHERE request_id = ?")
-            .bind(status.as_str()).bind(serde_json::to_string(&usage)?).bind(now_ms()).bind(request_id)
-            .execute(&self.pool).await?;
-        Ok(())
-    }
-
-    pub async fn begin_provider_call(&self, request_id: &str, call_index: usize) -> Result<()> {
-        sqlx::query(
-            "UPDATE runs SET provider_call_index = ?, updated_at_ms = ? WHERE request_id = ?",
-        )
-        .bind(call_index as i64)
-        .bind(now_ms())
-        .bind(request_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn save_tool_result(
-        &self,
-        request_id: &str,
-        batch_index: usize,
-        call_index: usize,
-        result: &ToolResult,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO run_tool_results
-             (request_id, batch_index, call_index, completion_seq, call_id, output_json, is_error, completed_at_ms)
-             VALUES (?, ?, ?,
-               (SELECT COALESCE(MAX(completion_seq), -1) + 1 FROM run_tool_results
-                WHERE request_id = ? AND batch_index = ?),
-               ?, ?, ?, ?)",
-        )
-        .bind(request_id)
-        .bind(batch_index as i64)
-        .bind(call_index as i64)
-        .bind(request_id)
-        .bind(batch_index as i64)
-        .bind(&result.call_id)
-        .bind(serde_json::to_string(&result.output)?)
-        .bind(result.is_error)
-        .bind(now_ms())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn load_tool_results(
-        &self,
-        request_id: &str,
-        batch_index: usize,
-    ) -> Result<Vec<ToolResult>> {
-        let rows = sqlx::query(
-            "SELECT call_id, output_json, is_error FROM run_tool_results
-             WHERE request_id = ? AND batch_index = ? ORDER BY completion_seq",
-        )
-        .bind(request_id)
-        .bind(batch_index as i64)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ToolResult {
-                    call_id: row.get(0),
-                    output: serde_json::from_str(row.get::<&str, _>(1))?,
-                    is_error: row.get(2),
-                })
-            })
-            .collect()
-    }
-
-    pub async fn clear_tool_results(&self, request_id: &str, batch_index: usize) -> Result<()> {
-        sqlx::query("DELETE FROM run_tool_results WHERE request_id = ? AND batch_index = ?")
-            .bind(request_id)
-            .bind(batch_index as i64)
-            .execute(&self.pool)
+        usage: Option<Usage>,
+        failure: Option<(&str, &str)>,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT conversation_id FROM runs WHERE run_id = ?")
+            .bind(run_id.as_str())
+            .fetch_optional(&mut *tx)
             .await?;
-        Ok(())
+        let Some(row) = row else {
+            return Err(Error::RunNotFound(run_id.to_string()));
+        };
+        let conversation_id: String = row.get(0);
+        let (category, summary) = failure.unzip();
+        sqlx::query(
+            "UPDATE runs SET status = ?, turn_usage_json = ?, failure_category = ?,
+             failure_summary = ?, updated_at_ms = ?
+             WHERE run_id = ? AND status = 'running'",
+        )
+        .bind(status.as_str())
+        .bind(serde_json::to_string(&usage)?)
+        .bind(category)
+        .bind(summary)
+        .bind(now_ms())
+        .bind(run_id.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let released = sqlx::query(
+            "UPDATE conversations SET active_run_id = NULL, updated_at_ms = ?
+             WHERE conversation_id = ? AND active_run_id = ?",
+        )
+        .bind(now_ms())
+        .bind(conversation_id)
+        .bind(run_id.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        tx.commit().await?;
+        Ok(released)
+    }
+}
+
+fn run_kind_columns(kind: &RunKind) -> (Option<&str>, Option<&str>, &'static str, Option<String>) {
+    match kind {
+        RunKind::Root => (None, None, "root", None),
+        RunKind::Subagent {
+            parent_run_id,
+            parent_tool_call_id,
+            kind,
+            ..
+        } => (
+            Some(parent_run_id.as_str()),
+            Some(parent_tool_call_id.as_str()),
+            "subagent",
+            Some(match kind {
+                crate::model::SubagentKind::GeneralPurpose => "generalPurpose".into(),
+                crate::model::SubagentKind::Named(name) => name.clone(),
+            }),
+        ),
     }
 }

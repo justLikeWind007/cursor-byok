@@ -1,16 +1,14 @@
-use crate::model::Usage;
+use crate::model::{ProviderReplayState, Usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinishReason {
     Stop,
     Length,
     ToolUse,
-    Error,
-    Aborted,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum ResponseEvent {
+pub enum ModelEvent {
     Start {
         model_call_id: String,
     },
@@ -32,6 +30,7 @@ pub enum ResponseEvent {
     ToolCallEnd {
         index: usize,
     },
+    ProviderReplayState(ProviderReplayState),
     Usage(Usage),
     Done(FinishReason),
 }

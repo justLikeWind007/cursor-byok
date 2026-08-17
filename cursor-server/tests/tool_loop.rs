@@ -3,18 +3,25 @@ mod fake_provider;
 #[path = "support/fixtures.rs"]
 mod fixtures;
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use cursor_server::{
+    cursor::prompting::{PromptAssets, PromptCompiler},
     cursor::{
-        connect, exec,
-        pending::{ExecContext, PendingExecRegistry},
+        connect,
         proto::agent::v1 as pb,
+        tools::{
+            codec,
+            runtime::{CursorToolRuntime, ExecContext},
+            ToolBatchState, ToolDispatcher,
+        },
     },
+    cursor::{CursorCommand, CursorSessionRegistry},
     model::{MessageContent, ToolCall},
-    prompting::{PromptAssets, PromptCompiler},
-    provider::{FinishReason, ResponseEvent},
-    run::{RunCommand, RunRegistry},
+    provider::{FinishReason, ModelEvent},
 };
 use prost::Message;
 use serde_json::json;
@@ -33,6 +40,9 @@ fn call(id: &str, name: &str) -> ToolCall {
 fn exec_context() -> ExecContext {
     ExecContext {
         conversation_id: "conversation".into(),
+        root_conversation_id: "conversation".into(),
+        model_id: "model".into(),
+        subagent_models: std::collections::HashMap::new(),
         terminals_folder: "/tmp/terminals".into(),
         admin_command_denylist: Vec::new(),
     }
@@ -56,7 +66,7 @@ fn dynamic_mcp_call_routes_to_the_captured_exec_message() {
         input_schema: None,
         input_schema_json: None,
     };
-    let message = cursor_server::cursor::exec::mcp_request(7, &call, &definition).unwrap();
+    let message = codec::mcp_request(7, &call, &definition).unwrap();
     let Some(pb::agent_server_message::Message::ExecServerMessage(exec)) = message.message else {
         panic!("expected ExecServerMessage")
     };
@@ -73,6 +83,128 @@ fn dynamic_mcp_call_routes_to_the_captured_exec_message() {
 }
 
 #[tokio::test]
+async fn call_mcp_tool_reuses_the_exact_definition_returned_by_mcp_state() {
+    let runtime = CursorToolRuntime::default();
+    let dispatcher = ToolDispatcher::new(runtime.clone());
+    let completed = HashSet::new();
+    let started = HashSet::new();
+    let state = ToolBatchState {
+        completed: &completed,
+        started: &started,
+        response_text: "",
+        response_thinking: "",
+    };
+    let discovery = call("get-tools", "GetMcpTools");
+    let request = dispatcher
+        .start_batch(&[discovery], state, &[], &BTreeMap::new(), &exec_context())
+        .await
+        .unwrap();
+    let Some(pb::agent_server_message::Message::ExecServerMessage(request)) =
+        request[0].messages[1].message.as_ref()
+    else {
+        panic!("expected MCP state Exec")
+    };
+    let event = codec::client_event(
+        &pb::ExecClientMessage {
+            id: request.id,
+            message: Some(pb::exec_client_message::Message::McpStateExecResult(
+                pb::McpStateExecResult {
+                    result: Some(pb::mcp_state_exec_result::Result::Success(
+                        pb::McpStateSuccess {
+                            servers: vec![pb::McpStateServer {
+                                server_name: "browser-use".into(),
+                                server_identifier: "plugin-browser-use-browser-use".into(),
+                                tools: vec![pb::McpToolDefinition {
+                                    name: "plugin-browser-use-browser-use-browser_exec".into(),
+                                    provider_identifier: "browser-use".into(),
+                                    tool_name: "browser_exec".into(),
+                                    description: "execute browser code".into(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(event, codec::ClientExecEvent::Completed(_)));
+
+    let mut invocation = call("call-mcp", "CallMcpTool");
+    invocation.arguments = json!({
+        "server": "plugin-browser-use-browser-use",
+        "toolName": "browser_exec",
+        "description": "run browser code",
+        "arguments": {"code": "print('ok')"}
+    });
+    let requests = dispatcher
+        .start_batch(
+            &[invocation],
+            ToolBatchState {
+                completed: &completed,
+                started: &started,
+                response_text: "",
+                response_thinking: "",
+            },
+            &[],
+            &BTreeMap::new(),
+            &exec_context(),
+        )
+        .await
+        .unwrap();
+    let Some(pb::agent_server_message::Message::ExecServerMessage(exec)) =
+        requests[0].messages[1].message.as_ref()
+    else {
+        panic!("expected MCP Exec")
+    };
+    let Some(pb::exec_server_message::Message::McpArgs(args)) = exec.message.as_ref() else {
+        panic!("expected McpArgs")
+    };
+    assert_eq!(args.name, "plugin-browser-use-browser-use-browser_exec");
+    assert_eq!(args.provider_identifier, "browser-use");
+    assert_eq!(args.tool_name, "browser_exec");
+    assert_eq!(args.server_identifier, "plugin-browser-use-browser-use");
+    assert_eq!(
+        args.args["code"].kind,
+        Some(prost_types::value::Kind::StringValue("print('ok')".into()))
+    );
+
+    let event = codec::client_event(
+        &pb::ExecClientMessage {
+            id: exec.id,
+            message: Some(pb::exec_client_message::Message::McpResult(pb::McpResult {
+                result: Some(pb::mcp_result::Result::Success(pb::McpSuccess {
+                    content: vec![pb::McpToolResultContentItem {
+                        content: Some(pb::mcp_tool_result_content_item::Content::Text(
+                            pb::McpTextContent {
+                                text: "browser result".into(),
+                                output_location: None,
+                            },
+                        )),
+                    }],
+                    is_error: false,
+                    structured_content: None,
+                })),
+            })),
+            ..Default::default()
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+    let codec::ClientExecEvent::Completed(completion) = event else {
+        panic!("expected MCP completion")
+    };
+    assert_eq!(completion.result().content, "browser result");
+    assert!(!completion.result().is_error);
+}
+
+#[tokio::test]
 async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     let mut shell = call("call-shell", "Shell");
     shell.arguments = json!({
@@ -82,7 +214,7 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
         "description": "Start HTTP server"
     });
     let context = exec_context();
-    let request = exec::request(7, &shell, &context).unwrap();
+    let request = codec::request(7, &shell, &context).unwrap();
     let Some(pb::agent_server_message::Message::ExecServerMessage(request)) = request.message
     else {
         panic!("expected ExecServerMessage")
@@ -102,9 +234,9 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     assert_eq!(args.conversation_id.as_deref(), Some("conversation"));
     assert_eq!(args.file_output_threshold_bytes, Some(40_000));
 
-    let pending = PendingExecRegistry::default();
-    let id = pending.reserve(&shell, &context).await.unwrap();
-    let delta = exec::client_event(
+    let pending = CursorToolRuntime::default();
+    let id = pending.reserve_exec(&shell, &context).await.unwrap();
+    let delta = codec::client_event(
         &pb::ExecClientMessage {
             id,
             message: Some(pb::exec_client_message::Message::ShellStream(
@@ -120,7 +252,7 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     )
     .await
     .unwrap();
-    let exec::ClientExecEvent::Delta(delta) = delta else {
+    let codec::ClientExecEvent::Delta(delta) = delta else {
         panic!("expected Shell stdout delta")
     };
     let Some(pb::agent_server_message::Message::InteractionUpdate(delta)) = delta.message else {
@@ -141,7 +273,7 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     };
     assert_eq!(stdout.content, "Serving HTTP on port 8000\n");
 
-    let completion = exec::client_event(
+    let completion = codec::client_event(
         &pb::ExecClientMessage {
             id,
             message: Some(pb::exec_client_message::Message::ShellStream(
@@ -164,12 +296,12 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     )
     .await
     .unwrap();
-    let exec::ClientExecEvent::Completed(completion) = completion else {
+    let codec::ClientExecEvent::Completed(completion) = completion else {
         panic!("expected background completion")
     };
     assert_eq!(
-        completion.result().output.as_str(),
-        Some(
+        completion.result().content,
+        (
             "shell running in background shell_id=42 pid=1234 terminals_folder=/tmp/terminals\nServing HTTP on port 8000\n"
         )
     );
@@ -180,38 +312,51 @@ async fn shell_uses_background_timeout_and_preserves_stream_identity() {
     assert_eq!(result.is_background, Some(true));
     assert_eq!(result.terminals_folder.as_deref(), Some("/tmp/terminals"));
     assert_eq!(result.pid, Some(1234));
+    assert!(
+        pending.drain_running().await.is_empty(),
+        "a backgrounded Shell is no longer an abortable Run Exec"
+    );
 }
 
 #[tokio::test]
 async fn exec_ids_are_monotonic_and_released_ids_are_not_reused() {
-    let pending = PendingExecRegistry::default();
+    let pending = CursorToolRuntime::default();
     let first = pending
-        .reserve(&call("call-1", "Read"), &exec_context())
+        .reserve_exec(&call("call-1", "Read"), &exec_context())
         .await
         .unwrap();
     assert_eq!(first, 1);
     assert_eq!(
-        pending.call(first).await.map(|call| call.call_id),
+        pending.exec_call(first).await.map(|call| call.call_id),
         Some("call-1".into())
     );
-    pending.discard(first).await;
-    assert!(pending.call(first).await.is_none());
+    pending.discard_exec(first).await;
+    assert!(pending.exec_call(first).await.is_none());
 
     let second = pending
-        .reserve(&call("call-2", "Read"), &exec_context())
+        .reserve_exec(&call("call-2", "Read"), &exec_context())
         .await
         .unwrap();
     assert_eq!(second, 2, "released Exec ids must not be reused in one Run");
+
+    let interaction = pending
+        .reserve_interaction(&call("call-3", "AskQuestion"), &exec_context())
+        .await
+        .unwrap();
+    assert_eq!(
+        interaction, 3,
+        "Exec and Interaction share one wire-id space"
+    );
 }
 
 #[tokio::test]
 async fn empty_exec_client_message_is_not_a_terminal_result() {
-    let pending = PendingExecRegistry::default();
+    let pending = CursorToolRuntime::default();
     let id = pending
-        .reserve(&call("call-1", "Read"), &exec_context())
+        .reserve_exec(&call("call-1", "Read"), &exec_context())
         .await
         .unwrap();
-    let event = exec::client_event(
+    let event = codec::client_event(
         &pb::ExecClientMessage {
             id,
             message: None,
@@ -221,20 +366,20 @@ async fn empty_exec_client_message_is_not_a_terminal_result() {
     )
     .await
     .unwrap();
-    assert!(matches!(event, exec::ClientExecEvent::Pending));
+    assert!(matches!(event, codec::ClientExecEvent::Pending));
     assert_eq!(
-        pending.call(id).await.map(|call| call.call_id),
+        pending.exec_call(id).await.map(|call| call.call_id),
         Some("call-1".into())
     );
 }
 
 #[tokio::test]
 async fn tool_success_is_not_inferred_from_debug_text() {
-    let pending = PendingExecRegistry::default();
+    let pending = CursorToolRuntime::default();
     let mut write = call("call-1", "Write");
     write.arguments = json!({"path": "/tmp/a", "contents": "x"});
-    let id = pending.reserve(&write, &exec_context()).await.unwrap();
-    let event = exec::client_event(
+    let id = pending.reserve_exec(&write, &exec_context()).await.unwrap();
+    let event = codec::client_event(
         &pb::ExecClientMessage {
             id,
             message: Some(pb::exec_client_message::Message::WriteResult(
@@ -252,7 +397,7 @@ async fn tool_success_is_not_inferred_from_debug_text() {
     )
     .await
     .unwrap();
-    let exec::ClientExecEvent::Completed(completion) = event else {
+    let codec::ClientExecEvent::Completed(completion) = event else {
         panic!("expected terminal write result")
     };
     assert!(!completion.result().is_error);
@@ -263,13 +408,62 @@ async fn tool_success_is_not_inferred_from_debug_text() {
 }
 
 #[tokio::test]
+async fn new_task_result_exposes_the_subagent_name_and_id_to_the_model() {
+    let pending = CursorToolRuntime::default();
+    let mut task = call("call-task", "Task");
+    task.arguments = json!({
+        "description": "Analyze game logic",
+        "prompt": "Inspect the game",
+        "run_in_background": true,
+        "subagent_type": "generalPurpose"
+    });
+    let id = pending.reserve_exec(&task, &exec_context()).await.unwrap();
+    let event = codec::client_event(
+        &pb::ExecClientMessage {
+            id,
+            message: Some(pb::exec_client_message::Message::SubagentResult(
+                pb::SubagentResult {
+                    result: Some(pb::subagent_result::Result::Success(pb::SubagentSuccess {
+                        agent_id: "child-id".into(),
+                        ..Default::default()
+                    })),
+                },
+            )),
+            ..Default::default()
+        },
+        &pending,
+    )
+    .await
+    .unwrap();
+    let codec::ClientExecEvent::Completed(completion) = event else {
+        panic!("expected terminal Task result")
+    };
+
+    assert_eq!(
+        completion.result().content,
+        "Subagent name: Analyze game logic\nSubagent ID: child-id"
+    );
+    let Some(pb::tool_call::Tool::TaskToolCall(tool)) = &completion.tool_call().tool else {
+        panic!("expected TaskToolCall")
+    };
+    let Some(pb::task_result::Result::Success(success)) = tool
+        .result
+        .as_ref()
+        .and_then(|result| result.result.as_ref())
+    else {
+        panic!("expected typed Task success")
+    };
+    assert_eq!(success.agent_id.as_deref(), Some("child-id"));
+}
+
+#[tokio::test]
 async fn an_exec_result_must_match_the_reserved_tool() {
-    let pending = PendingExecRegistry::default();
+    let pending = CursorToolRuntime::default();
     let id = pending
-        .reserve(&call("call-1", "Read"), &exec_context())
+        .reserve_exec(&call("call-1", "Read"), &exec_context())
         .await
         .unwrap();
-    let result = exec::client_event(
+    let result = codec::client_event(
         &pb::ExecClientMessage {
             id,
             message: Some(pb::exec_client_message::Message::WriteResult(
@@ -291,7 +485,127 @@ async fn an_exec_result_must_match_the_reserved_tool() {
     assert!(error
         .to_string()
         .contains("unexpected Exec result for tool Read"));
-    assert!(pending.call(id).await.is_none());
+    assert!(pending.exec_call(id).await.is_none());
+    assert_eq!(pending.completed_call(id).await.as_deref(), Some("call-1"));
+    let duplicate = codec::client_event(
+        &pb::ExecClientMessage {
+            id,
+            message: None,
+            ..Default::default()
+        },
+        &pending,
+    )
+    .await;
+    let Err(duplicate) = duplicate else {
+        panic!("duplicate terminal result must fail")
+    };
+    assert!(duplicate.to_string().contains("duplicate terminal"));
+}
+
+#[tokio::test]
+async fn unknown_exec_id_is_a_protocol_error() {
+    let result = codec::client_event(
+        &pb::ExecClientMessage {
+            id: 999,
+            message: Some(pb::exec_client_message::Message::ReadResult(
+                pb::ReadResult::default(),
+            )),
+            ..Default::default()
+        },
+        &CursorToolRuntime::default(),
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("unknown Exec id must fail")
+    };
+    assert!(matches!(
+        error,
+        cursor_server::Error::Protocol(message)
+            if message == "unknown ExecClientMessage id: 999"
+    ));
+}
+
+#[tokio::test]
+async fn await_shell_consumes_the_background_output_file_terminal_state() {
+    let runtime = CursorToolRuntime::default();
+    let dispatcher = ToolDispatcher::new(runtime.clone());
+    let mut await_call = call("await-call", "AwaitShell");
+    await_call.arguments = json!({
+        "shell_id": "42",
+        "block_until_ms": 1000,
+        "pattern": "ready",
+    });
+    await_call.arguments_text = await_call.arguments.to_string();
+    let completed = HashSet::new();
+    let started = HashSet::new();
+    let dispatched = dispatcher
+        .start_batch(
+            &[await_call],
+            ToolBatchState {
+                completed: &completed,
+                started: &started,
+                response_text: "",
+                response_thinking: "",
+            },
+            &[],
+            &BTreeMap::new(),
+            &exec_context(),
+        )
+        .await
+        .unwrap();
+    let exec = dispatched[0]
+        .messages
+        .iter()
+        .find_map(|message| match message.message.as_ref() {
+            Some(pb::agent_server_message::Message::ExecServerMessage(exec)) => Some(exec),
+            _ => None,
+        })
+        .unwrap();
+    let Some(pb::exec_server_message::Message::ReadArgs(read)) = exec.message.as_ref() else {
+        panic!("expected AwaitShell ReadArgs")
+    };
+    assert_eq!(read.path, "/tmp/terminals/42.txt");
+
+    let event = codec::client_event(
+        &pb::ExecClientMessage {
+            id: exec.id,
+            message: Some(pb::exec_client_message::Message::ReadResult(
+                pb::ReadResult {
+                    result: Some(pb::read_result::Result::Success(pb::ReadSuccess {
+                        output: Some(pb::read_success::Output::Content(
+                            "server ready\nexit_code: 0\n".into(),
+                        )),
+                        ..Default::default()
+                    })),
+                },
+            )),
+            ..Default::default()
+        },
+        &runtime,
+    )
+    .await
+    .unwrap();
+    let codec::ClientExecEvent::Completed(completion) = event else {
+        panic!("expected completed AwaitShell")
+    };
+    assert_eq!(completion.result().call_id, "await-call");
+    assert!(!completion.result().is_error);
+    let Some(pb::tool_call::Tool::AwaitToolCall(tool)) = completion.tool_call().tool.as_ref()
+    else {
+        panic!("expected AwaitToolCall")
+    };
+    let pb::await_result::Result::Success(success) =
+        tool.result.as_ref().unwrap().result.as_ref().unwrap()
+    else {
+        panic!("expected Await success")
+    };
+    let pb::await_success::AwaitResult::Complete(complete) = success.await_result.as_ref().unwrap()
+    else {
+        panic!("expected completed background task")
+    };
+    assert_eq!(complete.task_id, "42");
+    assert_eq!(complete.exit_code, Some(0));
+    assert_eq!(complete.regex_match.as_deref(), Some("ready"));
 }
 
 #[tokio::test]
@@ -299,46 +613,46 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
     let (directory, store) = fixtures::temp_store().await;
     let provider = fake_provider::FakeProvider::default();
     provider.push(vec![
-        ResponseEvent::Start {
+        ModelEvent::Start {
             model_call_id: "ignored".into(),
         },
-        ResponseEvent::ToolCallStart {
+        ModelEvent::ToolCallStart {
             index: 0,
             call_id: "call-1".into(),
             name: "Read".into(),
         },
-        ResponseEvent::ToolCallArgumentsDelta {
+        ModelEvent::ToolCallArgumentsDelta {
             index: 0,
             delta: "{\"path\":\"/tmp/a\"}".into(),
         },
-        ResponseEvent::ToolCallEnd { index: 0 },
-        ResponseEvent::Done(FinishReason::ToolUse),
+        ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Done(FinishReason::ToolUse),
     ]);
     provider.push(vec![
-        ResponseEvent::Start {
+        ModelEvent::Start {
             model_call_id: "ignored".into(),
         },
-        ResponseEvent::TextStart,
-        ResponseEvent::TextDelta("done".into()),
-        ResponseEvent::TextEnd,
-        ResponseEvent::Done(FinishReason::Stop),
+        ModelEvent::TextStart,
+        ModelEvent::TextDelta("done".into()),
+        ModelEvent::TextEnd,
+        ModelEvent::Done(FinishReason::Stop),
     ]);
     let assets = PromptAssets::load(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../prompt")
+            .join("../prompt/cursor")
             .as_path(),
     )
     .unwrap();
-    let registry = RunRegistry::new(
+    let registry = CursorSessionRegistry::new(
         store.clone(),
         Arc::new(provider.clone()),
         PromptCompiler::new(assets),
-        "test-model".into(),
+        Default::default(),
     );
     let handle = registry.get_or_create("tool-request").await.unwrap();
     let mut output = handle.subscribe();
     handle
-        .command(RunCommand::Append {
+        .command(CursorCommand::Append {
             seqno: 0,
             message: Box::new(client_run()),
         })
@@ -364,7 +678,7 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
         match server.message {
             Some(pb::agent_server_message::Message::KvServerMessage(kv)) => {
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno,
                         message: Box::new(kv_ack(kv.id)),
                     })
@@ -376,7 +690,7 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
                 saw_exec = true;
                 let exec_id = exec.id;
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno,
                         message: Box::new(pb::AgentClientMessage {
                             message: Some(pb::agent_client_message::Message::ExecClientMessage(
@@ -409,7 +723,7 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
                     .unwrap();
                 seqno += 1;
                 handle
-                    .command(RunCommand::Append {
+                    .command(CursorCommand::Append {
                         seqno,
                         message: Box::new(pb::AgentClientMessage {
                             message: Some(
@@ -461,13 +775,18 @@ async fn provider_tool_use_waits_for_client_result_then_calls_provider_again() {
     .await
     .unwrap();
     let provider_call_index: i64 =
-        sqlx::query_scalar("SELECT provider_call_index FROM runs WHERE request_id = ?")
+        sqlx::query_scalar("SELECT provider_call_index FROM runs WHERE run_id = ?")
             .bind("tool-request")
             .fetch_one(&database)
             .await
             .unwrap();
     assert_eq!(provider_call_index, 1);
-    let messages = store.load_messages("tool-conversation").await.unwrap();
+    let messages = store
+        .load_current_messages(&cursor_server::model::ConversationId::new(
+            "tool-conversation",
+        ))
+        .await
+        .unwrap();
     let result_position = messages
         .iter()
         .position(|message| matches!(message.content, MessageContent::ToolResult(_)))
@@ -501,6 +820,10 @@ fn client_run() -> pb::AgentClientMessage {
                 }),
                 conversation_id: Some("tool-conversation".into()),
                 run_id: Some("tool-request".into()),
+                requested_model: Some(pb::RequestedModel {
+                    model_id: "test-model".into(),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         )),

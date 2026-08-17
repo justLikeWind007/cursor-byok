@@ -1,114 +1,104 @@
 use sqlx::{Row, Sqlite, Transaction};
 
 use crate::{
-    model::{CanonicalMessage, RuntimeEvent},
-    Result,
+    model::{CanonicalMessage, ConversationId},
+    Error, Result,
 };
 
 use super::{now_ms, Store};
 
 impl Store {
-    pub async fn load_messages(&self, conversation_id: &str) -> Result<Vec<CanonicalMessage>> {
-        let rows = sqlx::query(
-            "SELECT payload_json FROM messages WHERE conversation_id = ? ORDER BY message_seq",
+    pub async fn message(
+        &self,
+        conversation_id: &ConversationId,
+        message_id: &str,
+    ) -> Result<Option<CanonicalMessage>> {
+        let payload: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM messages WHERE conversation_id = ? AND message_id = ?",
         )
-        .bind(conversation_id)
-        .fetch_all(&self.pool)
+        .bind(conversation_id.as_str())
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        payload
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .transpose()
+    }
+
+    pub(crate) async fn put_message_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        conversation_id: &ConversationId,
+        message: &CanonicalMessage,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(message)?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO messages
+             (conversation_id, message_id, role, origin, payload_json, runtime_event_id, created_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(conversation_id.as_str())
+        .bind(&message.message_id)
+        .bind(role_name(&message.role))
+        .bind(origin_name(&message.origin))
+        .bind(&payload)
+        .bind(&message.runtime_event_id)
+        .bind(now_ms())
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted {
+            return Ok(());
+        }
+
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM messages
+             WHERE conversation_id = ? AND (message_id = ? OR runtime_event_id = ?)",
+        )
+        .bind(conversation_id.as_str())
+        .bind(&message.message_id)
+        .bind(&message.runtime_event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        match existing {
+            Some(existing) if existing == payload => Ok(()),
+            Some(_) => Err(Error::Store(format!(
+                "message id or runtime event reused with different content: {}",
+                message.message_id
+            ))),
+            None => Err(Error::Store(format!(
+                "message insert was ignored without an existing object: {}",
+                message.message_id
+            ))),
+        }
+    }
+
+    pub(crate) async fn load_revision_messages_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        revision_id: i64,
+    ) -> Result<Vec<CanonicalMessage>> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE lineage(revision_id, parent_revision_id, depth) AS (
+                 SELECT revision_id, parent_revision_id, 0
+                 FROM conversation_revisions WHERE revision_id = ?
+                 UNION ALL
+                 SELECT r.revision_id, r.parent_revision_id, lineage.depth + 1
+                 FROM conversation_revisions r
+                 JOIN lineage ON r.revision_id = lineage.parent_revision_id
+             )
+             SELECT m.payload_json
+             FROM lineage
+             JOIN revision_messages rm ON rm.revision_id = lineage.revision_id
+             JOIN messages m
+               ON m.conversation_id = rm.conversation_id AND m.message_id = rm.message_id
+             ORDER BY lineage.depth DESC, rm.ordinal ASC",
+        )
+        .bind(revision_id)
+        .fetch_all(&mut **tx)
         .await?;
         rows.into_iter()
             .map(|row| serde_json::from_str(row.get::<&str, _>(0)).map_err(Into::into))
             .collect()
-    }
-
-    pub async fn append_messages(
-        &self,
-        conversation_id: &str,
-        messages: &[CanonicalMessage],
-    ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
-        for message in messages {
-            Self::append_message_tx(&mut tx, conversation_id, message).await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn append_runtime_event_once(
-        &self,
-        conversation_id: &str,
-        event: RuntimeEvent,
-    ) -> Result<bool> {
-        let message = event.into_message();
-        let mut tx = self.pool.begin().await?;
-        Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
-        let next_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(message_seq), -1) + 1 FROM messages WHERE conversation_id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let inserted = sqlx::query(
-            "INSERT OR IGNORE INTO messages
-             (conversation_id, message_seq, message_id, role, origin, payload_json, runtime_event_id, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(conversation_id)
-        .bind(next_seq)
-        .bind(&message.message_id)
-        .bind(role_name(&message.role))
-        .bind(origin_name(&message.origin))
-        .bind(serde_json::to_string(&message)?)
-        .bind(&message.runtime_event_id)
-        .bind(now_ms())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected() == 1;
-        tx.commit().await?;
-        Ok(inserted)
-    }
-
-    async fn append_message_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        conversation_id: &str,
-        message: &CanonicalMessage,
-    ) -> Result<()> {
-        let next_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(message_seq), -1) + 1 FROM messages WHERE conversation_id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO messages
-             (conversation_id, message_seq, message_id, role, origin, payload_json, runtime_event_id, created_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(conversation_id)
-        .bind(next_seq)
-        .bind(&message.message_id)
-        .bind(role_name(&message.role))
-        .bind(origin_name(&message.origin))
-        .bind(serde_json::to_string(message)?)
-        .bind(&message.runtime_event_id)
-        .bind(now_ms())
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn ensure_conversation_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        conversation_id: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT OR IGNORE INTO conversations(conversation_id, revision, updated_at_ms) VALUES (?, 0, ?)",
-        )
-        .bind(conversation_id)
-        .bind(now_ms())
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
     }
 }
 
